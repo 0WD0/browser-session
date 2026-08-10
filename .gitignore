@@ -1,0 +1,5 @@
+/target/
+*.elc
+*.tmp
+*.json
+!.gitkeep
