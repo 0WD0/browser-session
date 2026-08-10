@@ -1,35 +1,40 @@
 # browser-session
 
-`browser-session` is a small external helper and Emacs client for capturing a
-restricted set of cookies from a browser session through Chromium DevTools.
-It is provider-neutral: YouTube Music, X, and other consumers own their cookie
-allowlists, page scripts, and credential schemas.
+`browser-session` is a small external helper and Emacs client for capturing
+provider-scoped browser session material through Chromium DevTools or Firefox
+WebDriver BiDi. It is provider-neutral: YouTube Music, X, and other consumers
+own cookie requirements, page scripts, validation, and credential schemas.
 
-## Status
+## Boundary
 
-The initial implementation supports Chromium-compatible browsers through CDP.
-It can attach to an existing local DevTools endpoint or start a browser with an
-explicit profile directory. Firefox-family WebDriver BiDi support is planned
-for the first real consumer that needs the extracted boundary.
+The helper never reads browser cookie databases. It reads session material
+through the browser's remote-control protocol, writes a versioned private
+capture file, and emits only non-secret metadata in its JSON response. Cookie
+values never go to stdout, stderr, or logs.
 
-The helper never reads browser cookie databases. It reads cookies through the
-browser protocol, writes a versioned private capture file, and emits only
-non-secret metadata in its JSON response. Cookie values never go to stdout,
-stderr, or logs.
+The Emacs API deliberately supports two consumer styles:
+
+- use the metadata callback and pass the private capture-file path to an
+  external provider helper; or
+- explicitly call `browser-session-read` when the consumer intentionally needs
+  to handle its private session material in Elisp.
+
+The second style is a capability, not an implicit callback behavior. Consumers
+must not persist the returned values or include them in diagnostics.
 
 ## Build
 
-Build the helper and the Emacs client with:
+Build and verify the helper and Emacs client with:
 
 ```bash
 make check
 ```
 
-The helper binary is `target/debug/browser-session` during development.
+The development binary is `target/debug/browser-session`.
 
 ## CLI
 
-Capture selected cookies from a page:
+Capture individually required cookies:
 
 ```bash
 browser-session capture \
@@ -41,18 +46,48 @@ browser-session capture \
   --profile-dir ~/.config/google-chrome
 ```
 
-`--profile-dir` is a Chromium user-data directory, not the `Default/` child
-profile directory. Close the browser before asking the helper to start a
-profile that is already in use. An already-running browser is supported when
-it exposes the configured local CDP port.
+Use `--any-cookie` to require one name from an alternative group. A provider
+that needs a complete, origin-scoped session may explicitly use
+`--all-origin-cookies`; the helper still filters to the requested URL's host
+and unexpired cookies, including path-scoped cookies for that origin. It never
+captures a browser-wide cookie dump.
+
+`--profile-dir` means a Chromium user-data directory for Chromium-compatible
+browsers and a profile directory for Firefox or Zen. `--profile-root` asks the
+helper to use automatic isolated profiles below that root for Chrome, Firefox,
+or Zen. It uses `login-profile`, `login-profile-firefox`, or
+`login-profile-zen`, respectively.
+
+When an existing browser already exposes the configured local endpoint, the
+helper attaches to it and leaves it open. Otherwise, it can start an isolated
+browser and closes only the isolated instance it started. If a normal running
+browser prevents that, the helper returns the structured
+`browser-restart-required` error; `--restart-running` permits its explicit
+macOS restart path. Firefox and Zen use WebDriver BiDi; Chromium-compatible
+browsers use CDP.
 
 Optional `--script-file FILE` evaluates a provider-owned JavaScript expression
-in the opened page and stores its JSON result in the private capture file.
-The generic helper does not interpret that result.
+in the opened page and stores its JSON result in the private capture file. A
+script should return `null` until its required page state is ready, so the
+helper continues waiting. The generic helper does not interpret non-null page
+results.
+
+Prepare an ordinary Firefox-family isolated-profile login before a BiDi
+capture:
+
+```bash
+browser-session prepare-profile \
+  --url https://music.youtube.com \
+  --browser firefox \
+  --profile-root ~/.ytm-radio
+```
+
+The command opens the profile without remote control and waits for the user to
+sign in and close it. The provider can then start its normal capture flow.
 
 ## Emacs API
 
-`browser-session.el` is a thin asynchronous client for the helper:
+`browser-session.el` starts the helper asynchronously:
 
 ```elisp
 (require 'browser-session)
@@ -63,12 +98,16 @@ The generic helper does not interpret that result.
  :output-file "~/.config/chirp/browser-session.json"
  :callback (lambda (metadata)
              (message "Captured %s" (alist-get 'browser metadata)))
- :errorback #'message)
+ :errorback (lambda (error)
+              (message "%s" (browser-session-error-message error))))
 ```
 
-The callback receives metadata, not cookie values. A consumer explicitly reads
-the private output file with `browser-session-read`, validates its provider
-fields, and removes it when its workflow no longer needs it.
+The callback receives metadata, not cookie values. `ERRORBACK` receives a
+structured alist; use `browser-session-error-code` for routing decisions such
+as a deliberate restart confirmation.
+
+`browser-session-prepare-profile` exposes the Firefox/Zen preparation command
+with the same asynchronous callback conventions.
 
 ## Consumer boundary
 
@@ -81,5 +120,6 @@ browser-session capture
         -> provider-specific auth state
 ```
 
-Do not make this project emit a universal cookie dump or a shared credential
-file. A provider may request only the cookie names and origin it needs.
+Do not make this project emit a shared credential file. A provider controls its
+own origin and either an explicit cookie list or the exceptional complete
+origin-scoped capture it genuinely requires.

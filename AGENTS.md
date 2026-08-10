@@ -6,8 +6,10 @@
 CDP session capture, and private versioned capture files. It does not know
 YouTube, X, or any other provider's authentication schema.
 
-Provider packages own cookie allowlists, page scripts, validation, and mapping
-to their own credentials. Do not add provider-specific logic here.
+Provider packages own cookie scopes, page scripts, validation, and mapping to
+their own credentials. A provider may use an explicit allowlist or, only when
+its protocol genuinely requires it, an all-cookie capture scoped to one origin.
+Do not add provider-specific logic here.
 
 Do not read browser cookie databases or duplicate browser-specific encryption.
 Cookie values must never appear in stdout, stderr, logs, fixtures, or test
@@ -29,4 +31,5 @@ Public commands and functions need docstrings and user-facing commands need
 
 Keep the generic browser boundary small. Add a protocol or browser feature
 only when a real consumer needs it and its contract can be tested without a
-live browser.
+live browser. Keep metadata callbacks non-sensitive; explicit capture-file
+reads are a separate opt-in capability.

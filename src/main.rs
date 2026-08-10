@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: MIT
 
 use browser_session::capture::{
-    capture, CaptureOptions, CaptureResult, DEFAULT_CDP_PORT, DEFAULT_TIMEOUT_SECS,
+    capture, prepare_login_profile, CaptureOptions, CaptureResult, PrepareProfileOptions,
+    DEFAULT_CDP_PORT, DEFAULT_TIMEOUT_SECS,
 };
 use browser_session::error::{Result, SessionError};
 use serde::Serialize;
@@ -19,6 +20,7 @@ enum Command {
     Help,
     Version,
     Capture,
+    PrepareProfile,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -26,13 +28,17 @@ struct Options {
     command: Command,
     url: Option<String>,
     cookie_names: Vec<String>,
+    any_cookie_names: Vec<String>,
+    all_origin_cookies: bool,
     output: Option<PathBuf>,
     browser: Option<String>,
     profile_dir: Option<PathBuf>,
+    profile_root: Option<PathBuf>,
     port: u16,
     timeout_secs: u64,
     proxy: Option<String>,
     script_file: Option<PathBuf>,
+    restart_running: bool,
 }
 
 #[derive(Serialize)]
@@ -111,17 +117,39 @@ where
                     .url
                     .expect("capture URL was validated by parse_args"),
                 cookie_names: options.cookie_names,
+                any_cookie_names: options.any_cookie_names,
+                all_origin_cookies: options.all_origin_cookies,
                 output: options
                     .output
                     .expect("capture output was validated by parse_args"),
                 browser: options.browser,
                 profile_dir: options.profile_dir,
+                profile_root: options.profile_root,
                 port: options.port,
                 timeout: Duration::from_secs(options.timeout_secs),
                 proxy: options.proxy,
                 script_file: options.script_file,
+                restart_running: options.restart_running,
             })?;
             capture_result_json(capture)
+        }
+        Command::PrepareProfile => {
+            let prepared = prepare_login_profile(&PrepareProfileOptions {
+                url: options
+                    .url
+                    .expect("profile URL was validated by parse_args"),
+                browser: options.browser,
+                profile_dir: options.profile_dir,
+                profile_root: options.profile_root,
+                timeout: Duration::from_secs(options.timeout_secs),
+            })?;
+            json!({
+                "profile": {
+                    "prepared": true,
+                    "browser": prepared.browser,
+                    "path": prepared.path
+                }
+            })
         }
     };
     serde_json::to_string(&SuccessEnvelope {
@@ -136,13 +164,7 @@ where
 }
 
 fn capture_result_json(result: CaptureResult) -> serde_json::Value {
-    json!({
-        "browser": result.browser,
-        "output": result.output,
-        "url": result.url,
-        "cookies": result.cookies,
-        "page-captured": result.page_captured
-    })
+    serde_json::to_value(result).expect("capture result is serializable")
 }
 
 fn parse_args<I>(arguments: I) -> Result<Options>
@@ -152,120 +174,156 @@ where
 {
     let args = arguments.into_iter().map(Into::into).collect::<Vec<_>>();
     if args.is_empty() {
-        return Ok(Options {
-            command: Command::Help,
-            url: None,
-            cookie_names: Vec::new(),
-            output: None,
-            browser: None,
-            profile_dir: None,
-            port: DEFAULT_CDP_PORT,
-            timeout_secs: DEFAULT_TIMEOUT_SECS,
-            proxy: None,
-            script_file: None,
-        });
+        return Ok(default_options(Command::Help));
     }
     let command = match args[0].as_str() {
         "help" | "--help" | "-h" => Command::Help,
         "version" | "--version" => Command::Version,
         "capture" => Command::Capture,
+        "prepare-profile" => Command::PrepareProfile,
         other => {
             return Err(SessionError::invalid_request(format!(
                 "unknown command `{other}`"
             )))
         }
     };
-    if !matches!(command, Command::Capture) {
+    if matches!(command, Command::Help | Command::Version) {
         if args.len() > 1 {
             return Err(SessionError::invalid_request(
                 "help and version do not accept options",
             ));
         }
-        return Ok(Options {
-            command,
-            url: None,
-            cookie_names: Vec::new(),
-            output: None,
-            browser: None,
-            profile_dir: None,
-            port: DEFAULT_CDP_PORT,
-            timeout_secs: DEFAULT_TIMEOUT_SECS,
-            proxy: None,
-            script_file: None,
-        });
+        return Ok(default_options(command));
     }
 
-    let mut url = None;
-    let mut cookie_names = Vec::new();
-    let mut output = None;
-    let mut browser = None;
-    let mut profile_dir = None;
-    let mut port = DEFAULT_CDP_PORT;
-    let mut timeout_secs = DEFAULT_TIMEOUT_SECS;
-    let mut proxy = None;
-    let mut script_file = None;
+    let mut options = default_options(command);
     let mut index = 1;
     while index < args.len() {
         match args[index].as_str() {
-            "--url" => url = Some(option_value(&args, &mut index, "url")?),
-            "--cookie" => cookie_names.push(option_value(&args, &mut index, "cookie")?),
-            "--output" => output = Some(PathBuf::from(option_value(&args, &mut index, "output")?)),
-            "--browser" => browser = Some(option_value(&args, &mut index, "browser")?),
+            "--url" => options.url = Some(option_value(&args, &mut index, "url")?),
+            "--cookie" => options
+                .cookie_names
+                .push(option_value(&args, &mut index, "cookie")?),
+            "--any-cookie" => {
+                options
+                    .any_cookie_names
+                    .push(option_value(&args, &mut index, "any-cookie")?)
+            }
+            "--all-origin-cookies" => options.all_origin_cookies = true,
+            "--output" => {
+                options.output = Some(PathBuf::from(option_value(&args, &mut index, "output")?))
+            }
+            "--browser" => options.browser = Some(option_value(&args, &mut index, "browser")?),
             "--profile-dir" => {
-                profile_dir = Some(PathBuf::from(option_value(
+                options.profile_dir = Some(PathBuf::from(option_value(
                     &args,
                     &mut index,
                     "profile-dir",
                 )?))
             }
+            "--profile-root" => {
+                options.profile_root = Some(PathBuf::from(option_value(
+                    &args,
+                    &mut index,
+                    "profile-root",
+                )?))
+            }
             "--port" => {
                 let value = option_value(&args, &mut index, "port")?;
-                port = value.parse().map_err(|_| {
+                options.port = value.parse().map_err(|_| {
                     SessionError::invalid_request(format!("invalid port `{value}`"))
                 })?;
             }
             "--timeout-secs" => {
                 let value = option_value(&args, &mut index, "timeout-secs")?;
-                timeout_secs = value.parse().map_err(|_| {
+                options.timeout_secs = value.parse().map_err(|_| {
                     SessionError::invalid_request(format!("invalid timeout `{value}`"))
                 })?;
             }
-            "--proxy" => proxy = Some(option_value(&args, &mut index, "proxy")?),
+            "--proxy" => options.proxy = Some(option_value(&args, &mut index, "proxy")?),
             "--script-file" => {
-                script_file = Some(PathBuf::from(option_value(
+                options.script_file = Some(PathBuf::from(option_value(
                     &args,
                     &mut index,
                     "script-file",
                 )?))
             }
+            "--restart-running" => options.restart_running = true,
             other => {
                 return Err(SessionError::invalid_request(format!(
-                    "unknown capture option `{other}`"
+                    "unknown option `{other}`"
                 )))
             }
         }
         index += 1;
     }
+    validate_command_options(&options)?;
+    Ok(options)
+}
 
-    let url = url.ok_or_else(|| SessionError::invalid_request("missing --url URL"))?;
-    let output = output.ok_or_else(|| SessionError::invalid_request("missing --output FILE"))?;
-    if cookie_names.is_empty() {
+fn default_options(command: Command) -> Options {
+    Options {
+        command,
+        url: None,
+        cookie_names: Vec::new(),
+        any_cookie_names: Vec::new(),
+        all_origin_cookies: false,
+        output: None,
+        browser: None,
+        profile_dir: None,
+        profile_root: None,
+        port: DEFAULT_CDP_PORT,
+        timeout_secs: DEFAULT_TIMEOUT_SECS,
+        proxy: None,
+        script_file: None,
+        restart_running: false,
+    }
+}
+
+fn validate_command_options(options: &Options) -> Result<()> {
+    let url = options
+        .url
+        .as_deref()
+        .ok_or_else(|| SessionError::invalid_request("missing --url URL"))?;
+    if url.trim().is_empty() {
         return Err(SessionError::invalid_request(
-            "capture requires at least one --cookie NAME",
+            "capture URL must not be empty",
         ));
     }
-    Ok(Options {
-        command,
-        url: Some(url),
-        cookie_names,
-        output: Some(output),
-        browser,
-        profile_dir,
-        port,
-        timeout_secs,
-        proxy,
-        script_file,
-    })
+    if options.profile_dir.is_some() && options.profile_root.is_some() {
+        return Err(SessionError::invalid_request(
+            "profile-dir and profile-root cannot be used together",
+        ));
+    }
+    match options.command {
+        Command::Capture => {
+            if options.output.is_none() {
+                return Err(SessionError::invalid_request("missing --output FILE"));
+            }
+            if options.cookie_names.is_empty() && options.any_cookie_names.is_empty() {
+                return Err(SessionError::invalid_request(
+                    "capture requires at least one --cookie or --any-cookie NAME",
+                ));
+            }
+        }
+        Command::PrepareProfile => {
+            if options.output.is_some()
+                || !options.cookie_names.is_empty()
+                || !options.any_cookie_names.is_empty()
+                || options.all_origin_cookies
+                || options.port != DEFAULT_CDP_PORT
+                || options.proxy.is_some()
+                || options.script_file.is_some()
+                || options.restart_running
+            {
+                return Err(SessionError::invalid_request(
+                    "prepare-profile accepts only url, browser, profile, and timeout options",
+                ));
+            }
+        }
+        Command::Help | Command::Version => unreachable!("non-request command was returned"),
+    }
+    Ok(())
 }
 
 fn option_value(args: &[String], index: &mut usize, name: &str) -> Result<String> {
@@ -280,15 +338,26 @@ fn usage() -> String {
     [
         "usage:",
         "  browser-session version",
-        "  browser-session capture --url URL --cookie NAME... --output FILE [options]",
+        "  browser-session capture --url URL (--cookie NAME|--any-cookie NAME)... --output FILE [options]",
+        "  browser-session prepare-profile --url URL [options]",
         "",
         "capture options:",
-        "  --browser NAME|PATH       Chromium-compatible browser",
-        "  --profile-dir DIR         Chromium user-data directory",
-        "  --port N                  local DevTools port (default 29317)",
+        "  --browser NAME|PATH       supported browser or executable path",
+        "  --profile-dir DIR         isolated profile directory",
+        "  --profile-root DIR        automatic Chrome/Firefox/Zen profile root",
+        "  --port N                  local remote-control port (default 29317)",
         "  --timeout-secs N          wait timeout (default 180)",
-        "  --proxy URL               proxy for a browser started by the helper",
+        "  --proxy URL               proxy for a Chromium browser started by the helper",
         "  --script-file FILE        provider-owned JavaScript expression",
+        "  --any-cookie NAME         require one cookie from this alternative set",
+        "  --all-origin-cookies      capture all unexpired cookies scoped to URL",
+        "  --restart-running         permit one browser restart when supported",
+        "",
+        "prepare-profile options:",
+        "  --browser NAME|PATH       Firefox or Zen browser",
+        "  --profile-dir DIR         isolated Firefox-family profile directory",
+        "  --profile-root DIR        automatic Firefox/Zen profile root",
+        "  --timeout-secs N          wait for the user to close the profile",
     ]
     .join("\n")
 }
@@ -305,31 +374,69 @@ mod tests {
             "https://x.com",
             "--cookie",
             "auth_token",
-            "--cookie",
+            "--any-cookie",
             "ct0",
             "--output",
             "/tmp/session.json",
             "--browser",
             "chrome",
-            "--profile-dir",
-            "/tmp/profile",
+            "--profile-root",
+            "/tmp/profiles",
             "--port",
             "29999",
             "--timeout-secs",
             "12",
+            "--all-origin-cookies",
+            "--restart-running",
         ])
         .unwrap();
         assert_eq!(options.command, Command::Capture);
-        assert_eq!(options.cookie_names, vec!["auth_token", "ct0"]);
+        assert_eq!(options.cookie_names, vec!["auth_token"]);
+        assert_eq!(options.any_cookie_names, vec!["ct0"]);
+        assert!(options.all_origin_cookies);
         assert_eq!(options.port, 29999);
         assert_eq!(options.timeout_secs, 12);
+        assert!(options.restart_running);
     }
 
     #[test]
-    fn rejects_capture_without_cookies() {
+    fn parses_profile_preparation_options() {
+        let options = parse_args([
+            "prepare-profile",
+            "--url",
+            "https://music.youtube.com",
+            "--browser",
+            "firefox",
+            "--profile-dir",
+            "/tmp/profile",
+            "--timeout-secs",
+            "60",
+        ])
+        .unwrap();
+        assert_eq!(options.command, Command::PrepareProfile);
+        assert_eq!(options.browser, Some("firefox".to_string()));
+        assert_eq!(options.profile_dir, Some(PathBuf::from("/tmp/profile")));
+        assert_eq!(options.timeout_secs, 60);
+    }
+
+    #[test]
+    fn rejects_capture_without_cookie_requirements() {
         let error =
             parse_args(["capture", "--url", "https://x.com", "--output", "/tmp/a"]).unwrap_err();
         assert!(error.message.contains("--cookie"));
+    }
+
+    #[test]
+    fn rejects_profile_preparation_capture_options() {
+        let error = parse_args([
+            "prepare-profile",
+            "--url",
+            "https://x.com",
+            "--cookie",
+            "ct0",
+        ])
+        .unwrap_err();
+        assert!(error.message.contains("prepare-profile"));
     }
 
     #[test]
@@ -339,7 +446,9 @@ mod tests {
             output: PathBuf::from("/tmp/session.json"),
             url: "https://x.com".to_string(),
             cookies: vec!["auth_token".to_string()],
+            captured_cookie_count: 1,
             page_captured: false,
+            profile_dir: None,
         });
         let text = serde_json::to_string(&output).unwrap();
         assert!(!text.contains("cookie-value"));

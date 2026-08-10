@@ -10,7 +10,7 @@
 (require 'browser-session)
 
 (ert-deftest browser-session-builds-capture-arguments ()
-  "Capture arguments should preserve provider-selected cookie names."
+  "Capture arguments should preserve provider-selected requirements."
   (let ((browser-session-cdp-port 29999)
         (browser-session-timeout 42)
         (browser-session-proxy nil))
@@ -18,29 +18,33 @@
      (equal
       (browser-session--capture-arguments
        "https://x.com"
-       '("auth_token" "ct0")
+       '("auth_token")
+       '("ct0")
+       t
        "/tmp/session.json"
        "chrome"
-       "/tmp/profile"
-       nil)
+       nil
+       "/tmp/profile-root"
+       "/tmp/session.js"
+       t)
       '("capture" "--url" "https://x.com" "--output" "/tmp/session.json"
-        "--cookie" "auth_token" "--cookie" "ct0"
-        "--browser" "chrome" "--profile-dir" "/tmp/profile"
+        "--cookie" "auth_token" "--any-cookie" "ct0"
+        "--all-origin-cookies" "--script-file" "/tmp/session.js"
+        "--restart-running" "--browser" "chrome"
+        "--profile-root" "/tmp/profile-root"
         "--port" "29999" "--timeout-secs" "42")))))
 
-(ert-deftest browser-session-capture-uses-custom-browser-settings ()
-  "The capture command should use configured browser defaults."
-  (let ((browser-session-browser "chromium")
-        (browser-session-profile-directory "/tmp/profile"))
+(ert-deftest browser-session-builds-profile-preparation-arguments ()
+  "Profile preparation should not receive capture-only options."
+  (let ((browser-session-timeout 60)
+        (browser-session-proxy "http://127.0.0.1:7890"))
     (should
      (equal
-      (browser-session--capture-arguments
-       "https://x.com" '("ct0") "/tmp/session.json"
-       browser-session-browser browser-session-profile-directory nil)
-      '("capture" "--url" "https://x.com" "--output" "/tmp/session.json"
-        "--cookie" "ct0" "--browser" "chromium"
-        "--profile-dir" "/tmp/profile" "--port" "29317"
-        "--timeout-secs" "180")))))
+      (browser-session--prepare-profile-arguments
+       "https://music.youtube.com" "firefox" "/tmp/profile" nil)
+      '("prepare-profile" "--url" "https://music.youtube.com"
+        "--timeout-secs" "60" "--browser" "firefox"
+        "--profile-dir" "/tmp/profile")))))
 
 (ert-deftest browser-session-decodes-success-envelope ()
   "A supported helper envelope should return its data alist."
@@ -52,11 +56,78 @@
         (data . ((browser . "chrome") (output . "/tmp/session.json"))))))
     '((browser . "chrome") (output . "/tmp/session.json")))))
 
-(ert-deftest browser-session-rejects-unsupported-envelope ()
-  "An unsupported helper envelope should not be accepted."
-  (should-error
-   (browser-session--decode-envelope
-    (json-encode '((ok . t) (schema . 9) (protocol . 1) (data . nil))))))
+(ert-deftest browser-session-decodes-structured-helper-errors ()
+  "A helper error should preserve its stable code and message."
+  (let (payload)
+    (condition-case error
+        (browser-session--decode-envelope
+         (json-encode
+          '((ok . nil) (schema . 1) (protocol . 1)
+            (error . ((code . "browser-restart-required")
+                      (message . "Close the browser")
+                      (retryable . nil)
+                      (auth-required . nil))))))
+      (browser-session-error
+       (setq payload (browser-session--error-payload error))))
+    (should (equal (browser-session-error-code payload)
+                   "browser-restart-required"))
+    (should (equal (browser-session-error-message payload)
+                   "Close the browser"))))
+
+(ert-deftest browser-session-capture-delivers-structured-process-errors ()
+  "The asynchronous capture path should preserve helper error codes."
+  (skip-unless (executable-find "sh"))
+  (let ((script (make-temp-file "browser-session-helper-" nil ".sh"))
+        (browser-session-helper-command nil)
+        received)
+    (unwind-protect
+        (progn
+          (with-temp-file script
+            (insert "#!/bin/sh\n"
+                    "printf '%s\\n' '{\"ok\":false,\"schema\":1,\"protocol\":1,\"error\":{\"code\":\"browser-restart-required\",\"message\":\"Close the browser\",\"retryable\":false,\"auth-required\":false},\"warnings\":[]}'\n"
+                    "printf '%s\\n' 'diagnostic only' >&2\n"
+                    "exit 1\n"))
+          (set-file-modes script #o700)
+          (setq browser-session-helper-command script)
+          (browser-session-capture
+           :url "https://x.com"
+           :cookies '("ct0")
+           :output-file "/tmp/browser-session-test.json"
+           :errorback (lambda (error)
+                        (setq received error)))
+          (with-timeout (2 (ert-fail "browser-session helper did not report failure"))
+            (while (not received)
+              (accept-process-output nil 0.1)))
+          (should (equal (browser-session-error-code received)
+                         "browser-restart-required"))
+          (should (equal (browser-session-error-message received)
+                         "Close the browser")))
+      (delete-file script))))
+
+(ert-deftest browser-session-capture-delivers-metadata ()
+  "The asynchronous capture path should deliver non-secret metadata."
+  (skip-unless (executable-find "sh"))
+  (let ((script (make-temp-file "browser-session-helper-" nil ".sh"))
+        (browser-session-helper-command nil)
+        received)
+    (unwind-protect
+        (progn
+          (with-temp-file script
+            (insert "#!/bin/sh\n"
+                    "printf '%s\\n' '{\"ok\":true,\"schema\":1,\"protocol\":1,\"data\":{\"browser\":\"fake\",\"output\":\"/tmp/session.json\"},\"warnings\":[]}'\n"))
+          (set-file-modes script #o700)
+          (setq browser-session-helper-command script)
+          (browser-session-capture
+           :url "https://x.com"
+           :cookies '("ct0")
+           :output-file "/tmp/browser-session-test.json"
+           :callback (lambda (metadata)
+                       (setq received metadata)))
+          (with-timeout (2 (ert-fail "browser-session helper did not report success"))
+            (while (not received)
+              (accept-process-output nil 0.1)))
+          (should (equal (alist-get 'browser received) "fake")))
+      (delete-file script))))
 
 (ert-deftest browser-session-reads-private-capture-shape ()
   "A capture file should expose only its structured records to callers."

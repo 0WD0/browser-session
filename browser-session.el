@@ -33,20 +33,30 @@
 
 (defcustom browser-session-browser nil
   "Browser executable or supported browser name used for capture.
-When nil, the helper discovers an available Chromium-compatible browser."
+When nil, the helper uses the system default supported browser."
   :type '(choice (const :tag "Auto" nil)
                  string)
   :group 'browser-session)
 
 (defcustom browser-session-profile-directory nil
-  "Optional Chromium user-data directory used for capture.
-This is the user-data directory root, not its `Default/' child profile."
+  "Optional isolated profile directory used for capture.
+For Chromium this is the user-data directory root.  For Firefox and Zen it is
+the profile directory itself."
   :type '(choice (const :tag "Let the helper decide" nil)
                  directory)
   :group 'browser-session)
 
+(defcustom browser-session-profile-root nil
+  "Optional root for automatic Chrome and Firefox-family profiles.
+When non-nil and no explicit profile directory is supplied, the helper uses
+`login-profile', `login-profile-firefox', or `login-profile-zen' below this
+root for Chrome, Firefox, or Zen respectively."
+  :type '(choice (const :tag "Do not create an automatic profile" nil)
+                 directory)
+  :group 'browser-session)
+
 (defcustom browser-session-cdp-port 29317
-  "Local Chromium DevTools port used for capture."
+  "Local browser remote-control port used for capture."
   :type '(restricted-sexp
           :match-alternatives
           ((lambda (value)
@@ -54,7 +64,7 @@ This is the user-data directory root, not its `Default/' child profile."
   :group 'browser-session)
 
 (defcustom browser-session-timeout 180
-  "Seconds the helper waits for the requested browser session."
+  "Seconds the helper waits for requested browser state."
   :type '(restricted-sexp
           :match-alternatives
           ((lambda (value)
@@ -62,7 +72,7 @@ This is the user-data directory root, not its `Default/' child profile."
   :group 'browser-session)
 
 (defcustom browser-session-proxy nil
-  "Optional proxy URL passed to a browser that the helper starts."
+  "Optional proxy URL passed to a Chromium browser started by the helper."
   :type '(choice (const :tag "No proxy" nil)
                  string)
   :group 'browser-session)
@@ -73,37 +83,102 @@ This is the user-data directory root, not its `Default/' child profile."
 (defconst browser-session--protocol-version 1
   "Helper protocol version accepted by this client.")
 
+(define-error 'browser-session-error "Browser-session error")
+
 (defun browser-session--nonblank-string (value)
   "Return VALUE when it is a nonblank string, otherwise nil."
   (and (stringp value)
        (not (string-blank-p value))
        value))
 
-(defun browser-session--helper-arguments (&optional browser profile-directory)
-  "Return helper options for BROWSER and PROFILE-DIRECTORY."
+(defun browser-session--cookie-list-p (value)
+  "Return non-nil when VALUE is a list of nonblank cookie names."
+  (and (listp value)
+       (cl-every #'browser-session--nonblank-string value)))
+
+(defun browser-session--helper-arguments
+    (&optional browser profile-directory profile-root)
+  "Return helper options for BROWSER, PROFILE-DIRECTORY, and PROFILE-ROOT."
   (append
    (when-let* ((value (browser-session--nonblank-string browser)))
      (list "--browser" value))
    (when-let* ((value (browser-session--nonblank-string profile-directory)))
      (list "--profile-dir" (expand-file-name value)))
+   (when-let* ((value (browser-session--nonblank-string profile-root)))
+     (list "--profile-root" (expand-file-name value)))
    (list "--port" (number-to-string browser-session-cdp-port)
          "--timeout-secs" (number-to-string browser-session-timeout))
    (when-let* ((value (browser-session--nonblank-string browser-session-proxy)))
      (list "--proxy" value))))
 
 (defun browser-session--capture-arguments
-    (url cookies output-file browser profile-directory script-file)
-  "Return helper arguments for URL, COOKIES, and OUTPUT-FILE.
-BROWSER, PROFILE-DIRECTORY, and SCRIPT-FILE provide optional capture settings."
+    (url cookies any-cookies all-origin-cookies output-file browser
+         profile-directory profile-root script-file restart-running)
+  "Return capture arguments for URL, cookie requirements, and OUTPUT-FILE.
+COOKIES are individually required; ANY-COOKIES require any one listed name.
+When ALL-ORIGIN-COOKIES is non-nil, capture every unexpired cookie scoped to
+URL.  BROWSER, PROFILE-DIRECTORY, PROFILE-ROOT, SCRIPT-FILE, and
+RESTART-RUNNING provide optional capture settings."
   (append
    (list "capture" "--url" url "--output" (expand-file-name output-file))
    (cl-mapcan (lambda (cookie) (list "--cookie" cookie)) cookies)
+   (cl-mapcan (lambda (cookie) (list "--any-cookie" cookie)) any-cookies)
+   (when all-origin-cookies
+     (list "--all-origin-cookies"))
    (when-let* ((value (browser-session--nonblank-string script-file)))
      (list "--script-file" (expand-file-name value)))
-   (browser-session--helper-arguments browser profile-directory)))
+   (when restart-running
+     (list "--restart-running"))
+   (browser-session--helper-arguments browser profile-directory profile-root)))
+
+(defun browser-session--prepare-profile-arguments
+    (url browser profile-directory profile-root)
+  "Return profile-preparation arguments for URL.
+BROWSER, PROFILE-DIRECTORY, and PROFILE-ROOT provide browser settings."
+  (append
+   (list "prepare-profile" "--url" url
+         "--timeout-secs" (number-to-string browser-session-timeout))
+   (when-let* ((value (browser-session--nonblank-string browser)))
+     (list "--browser" value))
+   (when-let* ((value (browser-session--nonblank-string profile-directory)))
+     (list "--profile-dir" (expand-file-name value)))
+   (when-let* ((value (browser-session--nonblank-string profile-root)))
+     (list "--profile-root" (expand-file-name value)))))
+
+(defun browser-session--error-data (code message &optional retryable auth-required)
+  "Return a structured error with CODE and MESSAGE.
+RETRYABLE and AUTH-REQUIRED are optional error flags."
+  `((code . ,code)
+    (message . ,message)
+    (retryable . ,retryable)
+    (auth-required . ,auth-required)))
+
+(defun browser-session--signal-error (error)
+  "Signal ERROR as a structured `browser-session-error'."
+  (signal 'browser-session-error (list error)))
+
+(defun browser-session--error-payload (error)
+  "Return a structured payload from signaled ERROR."
+  (if (and (eq (car-safe error) 'browser-session-error)
+           (listp (cadr error)))
+      (cadr error)
+    (browser-session--error-data
+     "process-failure"
+     (error-message-string error))))
+
+;;;###autoload
+(defun browser-session-error-code (error)
+  "Return the stable browser-session error code from ERROR."
+  (alist-get 'code error))
+
+;;;###autoload
+(defun browser-session-error-message (error)
+  "Return the human-readable browser-session error message from ERROR."
+  (or (alist-get 'message error) "Browser-session failed"))
 
 (defun browser-session--decode-envelope (text)
-  "Decode helper JSON TEXT and return its metadata data alist."
+  "Decode helper JSON TEXT and return its metadata data alist.
+Signals `browser-session-error' with a structured payload for helper failure."
   (let ((envelope
          (condition-case error
              (json-parse-string text
@@ -112,19 +187,31 @@ BROWSER, PROFILE-DIRECTORY, and SCRIPT-FILE provide optional capture settings."
                                 :null-object nil
                                 :false-object nil)
            (json-parse-error
-            (error "Browser-session returned invalid JSON: %s"
-                   (error-message-string error))))))
+            (browser-session--signal-error
+             (browser-session--error-data
+              "process-failure"
+              (format "Browser-session returned invalid JSON: %s"
+                      (error-message-string error))))))))
     (unless (and (equal (alist-get 'schema envelope) browser-session--schema-version)
                  (equal (alist-get 'protocol envelope)
                         browser-session--protocol-version))
-      (error "Browser-session returned an unsupported protocol envelope"))
+      (browser-session--signal-error
+       (browser-session--error-data
+        "unsupported-protocol"
+        "Browser-session returned an unsupported protocol envelope")))
     (if (alist-get 'ok envelope)
         (or (alist-get 'data envelope)
-            (error "Browser-session returned no data"))
-      (let* ((payload (alist-get 'error envelope))
-             (message (or (alist-get 'message payload)
-                          "Browser-session failed")))
-        (error "%s" message)))))
+            (browser-session--signal-error
+             (browser-session--error-data
+              "process-failure" "Browser-session returned no data")))
+      (let ((payload (alist-get 'error envelope)))
+        (unless (and (listp payload)
+                     (stringp (alist-get 'code payload))
+                     (stringp (alist-get 'message payload)))
+          (browser-session--signal-error
+           (browser-session--error-data
+            "process-failure" "Browser-session returned an invalid error envelope")))
+        (browser-session--signal-error payload)))))
 
 (defun browser-session--process-result (stdout-buffer stderr-buffer)
   "Return parsed output from STDOUT-BUFFER and STDERR-BUFFER."
@@ -132,40 +219,32 @@ BROWSER, PROFILE-DIRECTORY, and SCRIPT-FILE provide optional capture settings."
         (stderr (with-current-buffer stderr-buffer (string-trim (buffer-string)))))
     (condition-case error
         (browser-session--decode-envelope stdout)
+      (browser-session-error
+       (signal (car error) (cdr error)))
       (error
-       (if (string-empty-p stderr)
-           (signal (car error) (cdr error))
-         (error "%s" stderr))))))
+       (browser-session--signal-error
+        (browser-session--error-data
+         "process-failure"
+         (if (string-empty-p stderr)
+             (error-message-string error)
+           stderr)))))))
 
-;;;###autoload
-(cl-defun browser-session-capture
-    (&key url cookies output-file browser profile-directory script-file
-     callback errorback)
-  "Capture selected COOKIES for URL into OUTPUT-FILE asynchronously.
-CALLBACK receives non-secret helper metadata after a successful capture.
-ERRORBACK receives one human-readable error string after failure.  URL,
-COOKIES, and OUTPUT-FILE are required."
-  (unless (browser-session--nonblank-string url)
-    (user-error "A browser-session URL is required"))
-  (unless (and (listp cookies)
-               cookies
-               (cl-every (lambda (cookie)
-                           (browser-session--nonblank-string cookie))
-                         cookies))
-    (user-error "At least one browser-session cookie name is required"))
-  (unless (browser-session--nonblank-string output-file)
-    (user-error "A private browser-session output file is required"))
+(defun browser-session--deliver-error (errorback error)
+  "Call ERRORBACK with structured ERROR, or display its message."
+  (if errorback
+      (funcall errorback error)
+    (message "%s" (browser-session-error-message error))))
+
+(defun browser-session--run-helper (arguments callback errorback)
+  "Run helper with ARGUMENTS asynchronously.
+CALLBACK receives successful metadata.  ERRORBACK receives structured helper
+error data."
   (unless (file-executable-p browser-session-helper-command)
     (user-error "Browser-session helper is not executable: %s"
                 browser-session-helper-command))
-  (let* ((stdout-buffer (generate-new-buffer " *browser-session-stdout*"))
-         (stderr-buffer (generate-new-buffer " *browser-session-stderr*"))
-         (arguments (browser-session--capture-arguments
-                     url cookies output-file
-                     (or browser browser-session-browser)
-                     (or profile-directory browser-session-profile-directory)
-                     script-file))
-         (process-name (format "browser-session-%s" (make-temp-name "capture-"))))
+  (let ((stdout-buffer (generate-new-buffer " *browser-session-stdout*"))
+        (stderr-buffer (generate-new-buffer " *browser-session-stderr*"))
+        (process-name (format "browser-session-%s" (make-temp-name "capture-"))))
     (make-process
      :name process-name
      :command (cons browser-session-helper-command arguments)
@@ -176,26 +255,77 @@ COOKIES, and OUTPUT-FILE are required."
      (lambda (process _event)
        (when (memq (process-status process) '(exit signal))
          (unwind-protect
-             (if (zerop (process-exit-status process))
-                 (condition-case error
+             (condition-case error
+                 (if (zerop (process-exit-status process))
                      (when callback
                        (funcall callback
                                 (browser-session--process-result
                                  stdout-buffer stderr-buffer)))
-                   (error
-                    (if errorback
-                        (funcall errorback (error-message-string error))
-                      (message "%s" (error-message-string error)))))
-               (let ((message
-                      (condition-case error
-                          (browser-session--process-result
-                           stdout-buffer stderr-buffer)
-                        (error (error-message-string error)))))
-                 (if errorback
-                     (funcall errorback message)
-                   (message "%s" message))))
+                   (progn
+                     (browser-session--process-result stdout-buffer stderr-buffer)
+                     (browser-session--deliver-error
+                      errorback
+                      (browser-session--error-data
+                       "process-failure"
+                       (format "Browser-session exited with status %d"
+                               (process-exit-status process))))))
+               (error
+                (browser-session--deliver-error
+                 errorback (browser-session--error-payload error))))
            (kill-buffer stdout-buffer)
            (kill-buffer stderr-buffer)))))))
+
+;;;###autoload
+(cl-defun browser-session-capture
+    (&key url cookies any-cookies all-origin-cookies output-file browser
+          profile-directory profile-root script-file restart-running callback
+          errorback)
+  "Capture selected browser session fields asynchronously.
+URL and OUTPUT-FILE are required.  COOKIES names fields that must all exist;
+ANY-COOKIES names an alternative group for which one field must exist.
+ALL-ORIGIN-COOKIES requests every unexpired cookie scoped to URL.  BROWSER,
+PROFILE-DIRECTORY, PROFILE-ROOT, SCRIPT-FILE, and RESTART-RUNNING configure the
+capture.  CALLBACK receives non-secret helper metadata after success.  ERRORBACK
+receives a structured error alist after failure."
+  (unless (browser-session--nonblank-string url)
+    (user-error "A browser-session URL is required"))
+  (unless (and (browser-session--cookie-list-p cookies)
+               (browser-session--cookie-list-p any-cookies)
+               (or cookies any-cookies))
+    (user-error "At least one required or alternative browser-session cookie name is required"))
+  (unless (browser-session--nonblank-string output-file)
+    (user-error "A private browser-session output file is required"))
+  (when (and (browser-session--nonblank-string profile-directory)
+             (browser-session--nonblank-string profile-root))
+    (user-error "Use either a browser-session profile directory or profile root"))
+  (browser-session--run-helper
+   (browser-session--capture-arguments
+    url cookies any-cookies all-origin-cookies output-file
+    (or browser browser-session-browser)
+    (or profile-directory browser-session-profile-directory)
+    (or profile-root browser-session-profile-root)
+    script-file restart-running)
+   callback errorback))
+
+;;;###autoload
+(cl-defun browser-session-prepare-profile
+    (&key url browser profile-directory profile-root callback errorback)
+  "Prepare an isolated Firefox-family browser profile for URL asynchronously.
+BROWSER selects Firefox or Zen.  PROFILE-DIRECTORY overrides PROFILE-ROOT.
+CALLBACK receives non-secret profile metadata after the user closes the browser.
+ERRORBACK receives a structured error alist after failure."
+  (unless (browser-session--nonblank-string url)
+    (user-error "A browser-session URL is required"))
+  (when (and (browser-session--nonblank-string profile-directory)
+             (browser-session--nonblank-string profile-root))
+    (user-error "Use either a browser-session profile directory or profile root"))
+  (browser-session--run-helper
+   (browser-session--prepare-profile-arguments
+    url
+    (or browser browser-session-browser)
+    (or profile-directory browser-session-profile-directory)
+    (or profile-root browser-session-profile-root))
+   callback errorback))
 
 (defun browser-session--decode-capture (text)
   "Decode and validate a private capture file containing TEXT."
@@ -219,8 +349,8 @@ COOKIES, and OUTPUT-FILE are required."
 ;;;###autoload
 (defun browser-session-read (file)
   "Read and validate private capture FILE.
-The returned value contains session material and must not be persisted or
-included in diagnostics."
+The returned value can contain session material.  Callers must avoid persisting
+it or including it in diagnostics."
   (unless (and (stringp file) (file-readable-p file))
     (user-error "Browser-session capture is not readable: %s" file))
   (browser-session--decode-capture
