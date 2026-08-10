@@ -23,10 +23,39 @@
   "Capture authenticated browser sessions."
   :group 'comm)
 
+(defun browser-session--helper-executable-name ()
+  "Return the browser-session helper executable name for this platform."
+  (if (eq system-type 'windows-nt)
+      "browser-session.exe"
+    "browser-session"))
+
+(defun browser-session--default-helper-command (&optional directory)
+  "Return the default helper path for DIRECTORY or the loaded package.
+
+The source-tree candidate lets a straight build use its symlinked source
+checkout, whose Rust target directory is not copied into the build directory.
+An executable found on `exec-path' is the fallback for installed packages."
+  (let* ((directory (or directory
+                        (file-name-directory
+                         (or load-file-name buffer-file-name default-directory))))
+         (name (browser-session--helper-executable-name))
+         (loaded-el (expand-file-name "browser-session.el" directory))
+         (source-directory
+          (when (file-exists-p loaded-el)
+            (file-name-directory (file-truename loaded-el))))
+         (candidates
+          (delete-dups
+           (delq nil
+                 (list (and source-directory
+                            (expand-file-name (concat "target/debug/" name)
+                                              source-directory))
+                       (expand-file-name (concat "target/debug/" name) directory)
+                       (executable-find name))))))
+    (or (cl-find-if #'file-executable-p candidates)
+        (car candidates))))
+
 (defcustom browser-session-helper-command
-  (expand-file-name "target/debug/browser-session"
-                    (file-name-directory
-                     (or load-file-name buffer-file-name default-directory)))
+  (browser-session--default-helper-command)
   "External helper executable used to capture browser sessions."
   :type 'file
   :group 'browser-session)
@@ -46,12 +75,15 @@ the profile directory itself."
                  directory)
   :group 'browser-session)
 
-(defcustom browser-session-profile-root nil
-  "Optional root for automatic Chrome and Firefox-family profiles.
-When non-nil and no explicit profile directory is supplied, the helper uses
+(defcustom browser-session-profile-root
+  (locate-user-emacs-file "browser-session/")
+  "Root for automatic Chrome and Firefox-family profiles.
+
+When no explicit profile directory is supplied, the helper uses
 `login-profile', `login-profile-firefox', or `login-profile-zen' below this
-root for Chrome, Firefox, or Zen respectively."
-  :type '(choice (const :tag "Do not create an automatic profile" nil)
+root for Chrome, Firefox, or Zen respectively.  Set this to nil to use a
+browser's normal profile instead."
+  :type '(choice (const :tag "Use the browser's normal profile" nil)
                  directory)
   :group 'browser-session)
 
@@ -130,6 +162,25 @@ RESTART-RUNNING provide optional capture settings."
    (when restart-running
      (list "--restart-running"))
    (browser-session--helper-arguments browser profile-directory profile-root)))
+
+(defun browser-session--effective-profile-settings
+    (profile-directory profile-root)
+  "Return effective PROFILE-DIRECTORY and PROFILE-ROOT settings.
+
+Explicit settings override browser-session defaults.  A profile directory
+always takes precedence over an automatic profile root."
+  (when (and (browser-session--nonblank-string profile-directory)
+             (browser-session--nonblank-string profile-root))
+    (user-error "Use either a browser-session profile directory or profile root"))
+  (cond
+   ((browser-session--nonblank-string profile-directory)
+    (cons profile-directory nil))
+   ((browser-session--nonblank-string profile-root)
+    (cons nil profile-root))
+   ((browser-session--nonblank-string browser-session-profile-directory)
+    (cons browser-session-profile-directory nil))
+   (t
+    (cons nil browser-session-profile-root))))
 
 (defun browser-session--prepare-profile-arguments
     (url browser profile-directory profile-root)
@@ -295,17 +346,17 @@ receives a structured error alist after failure."
     (user-error "At least one required or alternative browser-session cookie name is required"))
   (unless (browser-session--nonblank-string output-file)
     (user-error "A private browser-session output file is required"))
-  (when (and (browser-session--nonblank-string profile-directory)
-             (browser-session--nonblank-string profile-root))
-    (user-error "Use either a browser-session profile directory or profile root"))
-  (browser-session--run-helper
-   (browser-session--capture-arguments
-    url cookies any-cookies all-origin-cookies output-file
-    (or browser browser-session-browser)
-    (or profile-directory browser-session-profile-directory)
-    (or profile-root browser-session-profile-root)
-    script-file restart-running)
-   callback errorback))
+  (pcase-let ((`(,effective-profile-directory . ,effective-profile-root)
+               (browser-session--effective-profile-settings
+                profile-directory profile-root)))
+    (browser-session--run-helper
+     (browser-session--capture-arguments
+      url cookies any-cookies all-origin-cookies output-file
+      (or browser browser-session-browser)
+      effective-profile-directory
+      effective-profile-root
+      script-file restart-running)
+     callback errorback)))
 
 ;;;###autoload
 (cl-defun browser-session-prepare-profile
@@ -316,16 +367,16 @@ CALLBACK receives non-secret profile metadata after the user closes the browser.
 ERRORBACK receives a structured error alist after failure."
   (unless (browser-session--nonblank-string url)
     (user-error "A browser-session URL is required"))
-  (when (and (browser-session--nonblank-string profile-directory)
-             (browser-session--nonblank-string profile-root))
-    (user-error "Use either a browser-session profile directory or profile root"))
-  (browser-session--run-helper
-   (browser-session--prepare-profile-arguments
-    url
-    (or browser browser-session-browser)
-    (or profile-directory browser-session-profile-directory)
-    (or profile-root browser-session-profile-root))
-   callback errorback))
+  (pcase-let ((`(,effective-profile-directory . ,effective-profile-root)
+               (browser-session--effective-profile-settings
+                profile-directory profile-root)))
+    (browser-session--run-helper
+     (browser-session--prepare-profile-arguments
+      url
+      (or browser browser-session-browser)
+      effective-profile-directory
+      effective-profile-root)
+     callback errorback)))
 
 (defun browser-session--decode-capture (text)
   "Decode and validate a private capture file containing TEXT."

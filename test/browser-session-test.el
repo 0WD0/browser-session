@@ -9,6 +9,69 @@
 (require 'json)
 (require 'browser-session)
 
+(ert-deftest browser-session-default-helper-follows-symlinked-source ()
+  "Resolve a straight-style build's helper from its source checkout."
+  (let* ((root (make-temp-file "browser-session-helper-" t))
+         (build-directory (expand-file-name "build" root))
+         (source-directory (expand-file-name "source" root))
+         (source-el (expand-file-name "browser-session.el" source-directory))
+         (build-el (expand-file-name "browser-session.el" build-directory))
+         (helper (expand-file-name
+                  (concat "target/debug/"
+                          (browser-session--helper-executable-name))
+                  source-directory)))
+    (unwind-protect
+        (progn
+          (make-directory build-directory)
+          (make-directory (file-name-directory helper) t)
+          (with-temp-file source-el
+            (insert ";; source marker\n"))
+          (with-temp-file helper
+            (insert "#!/bin/sh\nexit 0\n"))
+          (set-file-modes helper #o700)
+          (condition-case error
+              (make-symbolic-link source-el build-el)
+            (file-error
+             (ert-skip (format "Cannot create a symbolic link: %s"
+                               (error-message-string error)))))
+          (should (equal (browser-session--default-helper-command build-directory)
+                         helper)))
+      (delete-directory root t))))
+
+(ert-deftest browser-session-capture-uses-an-isolated-profile-root ()
+  "Capture should use the configured automatic profile root by default."
+  (let ((browser-session-profile-directory nil)
+        (browser-session-profile-root "/tmp/browser-session-root")
+        arguments)
+    (cl-letf (((symbol-function 'browser-session--run-helper)
+               (lambda (value _callback _errorback)
+                 (setq arguments value)
+                 'capture-process)))
+      (browser-session-capture
+       :url "https://x.com"
+       :cookies '("auth_token")
+       :output-file "/tmp/browser-session-capture.json")
+      (should (member "--profile-root" arguments))
+      (should (member "/tmp/browser-session-root" arguments)))))
+
+(ert-deftest browser-session-explicit-profile-directory-overrides-root ()
+  "An explicit profile directory should suppress the automatic profile root."
+  (let ((browser-session-profile-directory nil)
+        (browser-session-profile-root "/tmp/browser-session-root")
+        arguments)
+    (cl-letf (((symbol-function 'browser-session--run-helper)
+               (lambda (value _callback _errorback)
+                 (setq arguments value)
+                 'capture-process)))
+      (browser-session-capture
+       :url "https://x.com"
+       :cookies '("auth_token")
+       :output-file "/tmp/browser-session-capture.json"
+       :profile-directory "/tmp/browser-session-profile")
+      (should (member "--profile-dir" arguments))
+      (should (member "/tmp/browser-session-profile" arguments))
+      (should-not (member "--profile-root" arguments)))))
+
 (ert-deftest browser-session-builds-capture-arguments ()
   "Capture arguments should preserve provider-selected requirements."
   (let ((browser-session-cdp-port 29999)

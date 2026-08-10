@@ -865,6 +865,26 @@ pub fn spawn_remote_browser(
     spawn_browser_process(browser, profile_dir, arguments)
 }
 
+pub fn wait_for_spawned_browser_exit(child: &mut Option<Child>, timeout: Duration) -> bool {
+    let exited = {
+        let Some(child) = child.as_mut() else {
+            return true;
+        };
+        let deadline = Instant::now() + timeout;
+        loop {
+            match child.try_wait() {
+                Ok(Some(_)) => break true,
+                Ok(None) if Instant::now() < deadline => sleep(Duration::from_millis(100)),
+                Ok(None) | Err(_) => break false,
+            }
+        }
+    };
+    if exited {
+        *child = None;
+    }
+    exited
+}
+
 pub fn terminate_spawned_browser(child: &mut Option<Child>) {
     if let Some(child) = child.as_mut() {
         if matches!(child.try_wait(), Ok(None)) {
@@ -1619,6 +1639,21 @@ mod tests {
             ),
             Some(profile.to_path_buf())
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn waits_for_a_spawned_browser_to_exit_gracefully() {
+        let child = Command::new("sh")
+            .args(["-c", "sleep 0.05"])
+            .spawn()
+            .unwrap();
+        let mut child = Some(child);
+        assert!(wait_for_spawned_browser_exit(
+            &mut child,
+            Duration::from_secs(1)
+        ));
+        assert!(child.is_none());
     }
 
     #[test]

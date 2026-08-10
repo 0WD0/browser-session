@@ -5,8 +5,8 @@ use crate::browser::{
     close_cdp_browser, connect_bidi, effective_profile_dir, evaluate_bidi, evaluate_cdp,
     open_bidi_context, open_cdp_target, prepare_profile, resolve_browser, restart_running_browser,
     running_browser_conflict, spawn_remote_browser, terminate_spawned_browser,
-    wait_for_bidi_connection, wait_for_cdp_version, Browser, BrowserCookie, BrowserProtocol,
-    CdpVersion, PreparedProfile,
+    wait_for_bidi_connection, wait_for_cdp_version, wait_for_spawned_browser_exit, Browser,
+    BrowserCookie, BrowserProtocol, CdpVersion, PreparedProfile,
 };
 use crate::error::{Result, SessionError};
 use reqwest::blocking::Client;
@@ -273,7 +273,9 @@ fn capture_cdp(
     })();
     if should_close_spawned_browser(spawned, profile_dir) {
         close_cdp_browser(version.browser_websocket_url());
-        terminate_spawned_browser(&mut child);
+        if !wait_for_spawned_browser_exit(&mut child, Duration::from_secs(5)) {
+            terminate_spawned_browser(&mut child);
+        }
     }
     result
 }
@@ -320,7 +322,9 @@ fn capture_bidi(
     })();
     if should_close_spawned_browser(spawned, profile_dir) {
         close_bidi_browser(&mut connection);
-        terminate_spawned_browser(&mut child);
+        if !wait_for_spawned_browser_exit(&mut child, Duration::from_secs(5)) {
+            terminate_spawned_browser(&mut child);
+        }
     }
     result
 }

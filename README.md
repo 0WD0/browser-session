@@ -60,8 +60,10 @@ or Zen. It uses `login-profile`, `login-profile-firefox`, or
 
 When an existing browser already exposes the configured local endpoint, the
 helper attaches to it and leaves it open. Otherwise, it can start an isolated
-browser and closes only the isolated instance it started. If a normal running
-browser prevents that, the helper returns the structured
+browser and closes only the isolated instance it started after allowing it to
+flush its persistent profile. Reusing the same profile root preserves the
+browser login across captures. If a normal running browser prevents that, the
+helper returns the structured
 `browser-restart-required` error; `--restart-running` permits its explicit
 macOS restart path. Firefox and Zen use WebDriver BiDi; Chromium-compatible
 browsers use CDP.
@@ -104,7 +106,10 @@ sign in and close it. The provider can then start its normal capture flow.
 
 The callback receives metadata, not cookie values. `ERRORBACK` receives a
 structured alist; use `browser-session-error-code` for routing decisions such
-as a deliberate restart confirmation.
+as a deliberate restart confirmation. The Emacs client defaults
+`browser-session-profile-root` to `(locate-user-emacs-file "browser-session/")`,
+giving Chrome, Firefox, and Zen stable isolated profiles. Set it to nil only
+when intentionally using a browser's normal profile.
 
 `browser-session-prepare-profile` exposes the Firefox/Zen preparation command
 with the same asynchronous callback conventions.
