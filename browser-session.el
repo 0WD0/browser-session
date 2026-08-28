@@ -313,6 +313,7 @@ Return a `browser-session-request' that can be cancelled."
            :name process-name
            :command (cons browser-session-helper-command arguments)
            :buffer stdout-buffer
+           :connection-type 'pipe
            :stderr stderr-buffer
            :noquery t
            :coding 'utf-8-unix

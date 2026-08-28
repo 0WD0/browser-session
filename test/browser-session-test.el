@@ -263,6 +263,37 @@
           (should (equal (alist-get 'browser received) "fake")))
       (delete-file script))))
 
+(ert-deftest browser-session-capture-closes-stdin-after-provider-script ()
+  "The real process path should deliver the script and a pipe EOF."
+  (skip-unless (and (executable-find "sh") (executable-find "cat")))
+  (let ((helper (make-temp-file "browser-session-helper-" nil ".sh"))
+        (browser-session-helper-command nil)
+        received
+        failure)
+    (unwind-protect
+        (progn
+          (with-temp-file helper
+            (insert
+             "#!/bin/sh\n"
+             "input=$(cat)\n"
+             "if [ \"$input\" != 'provider-expression' ]; then exit 2; fi\n"
+             "printf '%s\\n' '{\"ok\":true,\"schema\":1,\"protocol\":1,\"data\":{\"browser\":\"stdin\",\"output\":\"/tmp/session.json\"},\"warnings\":[]}'\n"))
+          (set-file-modes helper #o700)
+          (setq browser-session-helper-command helper)
+          (browser-session-capture
+           :url "https://example.com/challenge"
+           :script "provider-expression"
+           :output-file "/tmp/browser-session-test.json"
+           :callback (lambda (metadata) (setq received metadata))
+           :errorback (lambda (error) (setq failure error)))
+          (with-timeout
+              (2 (ert-fail "browser-session helper did not receive stdin EOF"))
+            (while (not (or received failure))
+              (accept-process-output nil 0.1)))
+          (should-not failure)
+          (should (equal (alist-get 'browser received) "stdin")))
+      (delete-file helper))))
+
 (ert-deftest browser-session-cancel-signals-a-request-once ()
   "Cancellation should interrupt only the helper represented by the request."
   (let ((request (browser-session--request-create))
