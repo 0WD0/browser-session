@@ -31,6 +31,9 @@ impl SessionError {
         Self::new("invalid-request", message, false, false)
     }
 
+    pub fn cancelled(message: impl Into<String>) -> Self {
+        Self::new("cancelled", message, false, false)
+    }
     pub fn auth_required(message: impl Into<String>) -> Self {
         Self::new("auth-required", message, false, true)
     }

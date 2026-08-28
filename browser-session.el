@@ -34,7 +34,8 @@
 
 The source-tree candidate lets a straight build use its symlinked source
 checkout, whose Rust target directory is not copied into the build directory.
-An executable found on `exec-path' is the fallback for installed packages."
+An executable found on variable `exec-path' is the fallback for installed
+packages."
   (let* ((directory (or directory
                         (file-name-directory
                          (or load-file-name buffer-file-name default-directory))))
@@ -116,6 +117,12 @@ browser's normal profile instead."
   "Helper protocol version accepted by this client.")
 
 (define-error 'browser-session-error "Browser-session error")
+
+(cl-defstruct (browser-session-request
+               (:constructor browser-session--request-create))
+  "One asynchronous browser-session helper request."
+  process
+  canceled-p)
 
 (defun browser-session--nonblank-string (value)
   "Return VALUE when it is a nonblank string, otherwise nil."
@@ -289,42 +296,65 @@ Signals `browser-session-error' with a structured payload for helper failure."
 (defun browser-session--run-helper (arguments callback errorback)
   "Run helper with ARGUMENTS asynchronously.
 CALLBACK receives successful metadata.  ERRORBACK receives structured helper
-error data."
+error data.  Return a `browser-session-request' that can be cancelled."
   (unless (file-executable-p browser-session-helper-command)
     (user-error "Browser-session helper is not executable: %s"
                 browser-session-helper-command))
-  (let ((stdout-buffer (generate-new-buffer " *browser-session-stdout*"))
-        (stderr-buffer (generate-new-buffer " *browser-session-stderr*"))
-        (process-name (format "browser-session-%s" (make-temp-name "capture-"))))
-    (make-process
-     :name process-name
-     :command (cons browser-session-helper-command arguments)
-     :buffer stdout-buffer
-     :stderr stderr-buffer
-     :noquery t
-     :sentinel
-     (lambda (process _event)
-       (when (memq (process-status process) '(exit signal))
-         (unwind-protect
-             (condition-case error
-                 (if (zerop (process-exit-status process))
-                     (when callback
-                       (funcall callback
-                                (browser-session--process-result
-                                 stdout-buffer stderr-buffer)))
-                   (progn
-                     (browser-session--process-result stdout-buffer stderr-buffer)
-                     (browser-session--deliver-error
-                      errorback
-                      (browser-session--error-data
-                       "process-failure"
-                       (format "Browser-session exited with status %d"
-                               (process-exit-status process))))))
-               (error
-                (browser-session--deliver-error
-                 errorback (browser-session--error-payload error))))
-           (kill-buffer stdout-buffer)
-           (kill-buffer stderr-buffer)))))))
+  (let* ((stdout-buffer (generate-new-buffer " *browser-session-stdout*"))
+         (stderr-buffer (generate-new-buffer " *browser-session-stderr*"))
+         (process-name
+          (format "browser-session-%s" (make-temp-name "capture-")))
+         (request (browser-session--request-create))
+         (process
+          (make-process
+           :name process-name
+           :command (cons browser-session-helper-command arguments)
+           :buffer stdout-buffer
+           :stderr stderr-buffer
+           :noquery t
+           :sentinel
+           (lambda (finished-process _event)
+             (when (memq (process-status finished-process) '(exit signal))
+               (unwind-protect
+                   (condition-case error
+                       (if (zerop (process-exit-status finished-process))
+                           (when callback
+                             (funcall callback
+                                      (browser-session--process-result
+                                       stdout-buffer stderr-buffer)))
+                         (progn
+                           (browser-session--process-result
+                            stdout-buffer stderr-buffer)
+                           (browser-session--deliver-error
+                            errorback
+                            (browser-session--error-data
+                             "process-failure"
+                             (format "Browser-session exited with status %d"
+                                     (process-exit-status
+                                      finished-process))))))
+                     (error
+                      (browser-session--deliver-error
+                       errorback (browser-session--error-payload error))))
+                 (setf (browser-session-request-process request) nil)
+                 (kill-buffer stdout-buffer)
+                 (kill-buffer stderr-buffer)))))))
+    (setf (browser-session-request-process request) process)
+    request))
+
+;;;###autoload
+(defun browser-session-cancel (request)
+  "Cancel asynchronous browser-session REQUEST cooperatively.
+REQUEST must be a live value returned by `browser-session-capture' or
+`browser-session-prepare-profile'.  Its error callback receives the stable
+`cancelled' error after the helper has closed any isolated browser it started."
+  (unless (browser-session-request-p request)
+    (user-error "Invalid browser-session request"))
+  (unless (browser-session-request-canceled-p request)
+    (setf (browser-session-request-canceled-p request) t)
+    (when-let* ((process (browser-session-request-process request))
+                ((process-live-p process)))
+      (signal-process process 'SIGINT))
+    t))
 
 ;;;###autoload
 (cl-defun browser-session-capture
@@ -334,16 +364,20 @@ error data."
   "Capture selected browser session fields asynchronously.
 URL and OUTPUT-FILE are required.  COOKIES names fields that must all exist;
 ANY-COOKIES names an alternative group for which one field must exist.
-ALL-ORIGIN-COOKIES requests every unexpired cookie scoped to URL.  BROWSER,
-PROFILE-DIRECTORY, PROFILE-ROOT, SCRIPT-FILE, and RESTART-RUNNING configure the
-capture.  CALLBACK receives non-secret helper metadata after success.  ERRORBACK
-receives a structured error alist after failure."
+SCRIPT-FILE is a provider-owned expression whose non-null result completes the
+capture; it may be the sole completion requirement.  ALL-ORIGIN-COOKIES
+requests every unexpired cookie scoped to URL.  BROWSER, PROFILE-DIRECTORY,
+PROFILE-ROOT, and RESTART-RUNNING configure the capture.  CALLBACK receives
+non-secret helper metadata after success.  ERRORBACK receives a structured
+error alist after failure.  Return a cancellable `browser-session-request'."
   (unless (browser-session--nonblank-string url)
     (user-error "A browser-session URL is required"))
   (unless (and (browser-session--cookie-list-p cookies)
-               (browser-session--cookie-list-p any-cookies)
-               (or cookies any-cookies))
-    (user-error "At least one required or alternative browser-session cookie name is required"))
+               (browser-session--cookie-list-p any-cookies))
+    (user-error "Browser-session cookie names must be nonblank strings"))
+  (unless (or cookies any-cookies
+              (browser-session--nonblank-string script-file))
+    (user-error "At least one cookie requirement or page script is required"))
   (unless (browser-session--nonblank-string output-file)
     (user-error "A private browser-session output file is required"))
   (pcase-let ((`(,effective-profile-directory . ,effective-profile-root)
@@ -417,6 +451,16 @@ CAPTURE should be the value returned by `browser-session-read'."
                (equal (alist-get 'schema capture) browser-session--schema-version))
     (user-error "Invalid browser-session capture"))
   (alist-get 'cookies capture))
+
+;;;###autoload
+(defun browser-session-page (capture)
+  "Return the provider-owned page result from validated CAPTURE.
+CAPTURE should be the value returned by `browser-session-read'.  The result may
+contain private session material and must not be persisted or diagnosed."
+  (unless (and (listp capture)
+               (equal (alist-get 'schema capture) browser-session--schema-version))
+    (user-error "Invalid browser-session capture"))
+  (alist-get 'page capture))
 
 (provide 'browser-session)
 

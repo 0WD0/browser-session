@@ -115,6 +115,32 @@
         "--profile-root" "/tmp/profile-root"
         "--port" "29999" "--timeout-secs" "42")))))
 
+(ert-deftest browser-session-allows-page-script-without-cookies ()
+  "A provider page result may be the capture's sole completion requirement."
+  (let (arguments)
+    (cl-letf (((symbol-function 'browser-session--run-helper)
+               (lambda (value _callback _errorback)
+                 (setq arguments value)
+                 'capture-request)))
+      (should
+       (eq
+        (browser-session-capture
+         :url "https://example.com/challenge"
+         :output-file "/tmp/browser-session-page.json"
+         :script-file "/tmp/provider.js")
+        'capture-request))
+      (should (member "--script-file" arguments))
+      (should-not (member "--cookie" arguments))
+      (should-not (member "--any-cookie" arguments)))))
+
+(ert-deftest browser-session-rejects-capture-without-completion-requirement ()
+  "A capture should not complete from URL navigation alone."
+  (should-error
+   (browser-session-capture
+    :url "https://example.com"
+    :output-file "/tmp/browser-session-page.json")
+   :type 'user-error))
+
 (ert-deftest browser-session-builds-profile-preparation-arguments ()
   "Profile preparation should not receive capture-only options."
   (let ((browser-session-timeout 60)
@@ -210,23 +236,41 @@
           (should (equal (alist-get 'browser received) "fake")))
       (delete-file script))))
 
+(ert-deftest browser-session-cancel-signals-a-request-once ()
+  "Cancellation should interrupt only the helper represented by the request."
+  (let ((request (browser-session--request-create))
+        signals)
+    (setf (browser-session-request-process request) 'fake-process)
+    (cl-letf (((symbol-function 'process-live-p) (lambda (_process) t))
+              ((symbol-function 'signal-process)
+               (lambda (process signal)
+                 (push (list process signal) signals))))
+      (should (browser-session-cancel request))
+      (should-not (browser-session-cancel request))
+      (should (browser-session-request-canceled-p request))
+      (should (equal signals '((fake-process SIGINT)))))))
+
 (ert-deftest browser-session-reads-private-capture-shape ()
   "A capture file should expose only its structured records to callers."
-  (let ((file (make-temp-file "browser-session-test-" nil ".json")))
+  (let ((file (make-temp-file "browser-session-test-" nil ".json"))
+        (payload
+         '((schema . 1)
+           (source . ((browser . "chrome") (url . "https://x.com")))
+           (cookies . (((name . "ct0") (value . "test-value"))))
+           (page . ((ticket . "synthetic")
+                    (randstr . "@test")
+                    (sid . "123"))))))
     (unwind-protect
         (progn
           (with-temp-file file
-            (insert
-             (json-encode
-              `((schema . 1)
-                (source . ((browser . "chrome") (url . "https://x.com")))
-                (cookies . (((name . "ct0")
-                             (value . ,(format "test-%s" (emacs-pid))))))))))
+            (insert (json-encode payload)))
           (let ((capture (browser-session-read file)))
             (should (equal (alist-get 'browser (alist-get 'source capture))
                            "chrome"))
             (should (equal (alist-get 'name (car (browser-session-cookies capture)))
-                           "ct0"))))
+                           "ct0"))
+            (should (equal (alist-get 'sid (browser-session-page capture))
+                           "123"))))
       (delete-file file))))
 
 ;;; browser-session-test.el ends here

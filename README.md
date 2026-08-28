@@ -50,7 +50,8 @@ Use `--any-cookie` to require one name from an alternative group. A provider
 that needs a complete, origin-scoped session may explicitly use
 `--all-origin-cookies`; the helper still filters to the requested URL's host
 and unexpired cookies, including path-scoped cookies for that origin. It never
-captures a browser-wide cookie dump.
+captures a browser-wide cookie dump. A provider that needs only a page result
+may omit cookie requirements when it supplies `--script-file`.
 
 `--profile-dir` means a Chromium user-data directory for Chromium-compatible
 browsers and a profile directory for Firefox or Zen. `--profile-root` asks the
@@ -72,7 +73,8 @@ Optional `--script-file FILE` evaluates a provider-owned JavaScript expression
 in the opened page and stores its JSON result in the private capture file. A
 script should return `null` until its required page state is ready, so the
 helper continues waiting. The generic helper does not interpret non-null page
-results.
+results. A page script may be the capture's sole completion requirement, in
+which case the capture contains an empty `cookies` array.
 
 Prepare an ordinary Firefox-family isolated-profile login before a BiDi
 capture:
@@ -103,6 +105,13 @@ sign in and close it. The provider can then start its normal capture flow.
  :errorback (lambda (error)
               (message "%s" (browser-session-error-message error))))
 ```
+
+`browser-session-capture` returns a `browser-session-request`. Providers may
+call `browser-session-cancel` to interrupt it; the error callback receives the
+stable `cancelled` code after the helper has closed an isolated browser it
+started. `browser-session-page` returns the provider-owned page result from a
+validated private capture. Page results may contain secrets and follow the same
+non-persistence and non-diagnostic rules as cookie values.
 
 The callback receives metadata, not cookie values. `ERRORBACK` receives a
 structured alist; use `browser-session-error-code` for routing decisions such

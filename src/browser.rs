@@ -8,6 +8,7 @@ use std::fs;
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 use tungstenite::stream::MaybeTlsStream;
@@ -314,6 +315,18 @@ pub fn prepare_profile(
     profile_root: Option<&Path>,
     timeout: Duration,
 ) -> Result<PreparedProfile> {
+    let cancelled = AtomicBool::new(false);
+    prepare_profile_with_cancel(url, browser, profile_dir, profile_root, timeout, &cancelled)
+}
+
+pub fn prepare_profile_with_cancel(
+    url: &str,
+    browser: &Browser,
+    profile_dir: Option<&Path>,
+    profile_root: Option<&Path>,
+    timeout: Duration,
+    cancelled: &AtomicBool,
+) -> Result<PreparedProfile> {
     if browser.protocol() != BrowserProtocol::Bidi {
         return Err(SessionError::invalid_request(
             "profile preparation supports only Firefox and Zen",
@@ -327,7 +340,11 @@ pub fn prepare_profile(
         })?;
     let arguments = profile_browser_arguments(&profile_dir, url);
     let mut child = spawn_browser_process(browser, Some(&profile_dir), arguments)?;
-    wait_for_profile_browser_exit(&mut child, timeout, url)?;
+    if let Err(error) = wait_for_profile_browser_exit(&mut child, timeout, url, cancelled) {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(error);
+    }
     Ok(PreparedProfile {
         browser: browser.name().to_string(),
         path: profile_dir,
@@ -952,9 +969,19 @@ fn profile_browser_arguments(profile_dir: &Path, url: &str) -> Vec<String> {
     ]
 }
 
-fn wait_for_profile_browser_exit(child: &mut Child, timeout: Duration, url: &str) -> Result<()> {
+fn wait_for_profile_browser_exit(
+    child: &mut Child,
+    timeout: Duration,
+    url: &str,
+    cancelled: &AtomicBool,
+) -> Result<()> {
     let started = Instant::now();
     loop {
+        if cancelled.load(Ordering::Acquire) {
+            return Err(SessionError::cancelled(
+                "browser profile preparation was cancelled",
+            ));
+        }
         match child.try_wait() {
             Ok(Some(status)) if status.success() => return Ok(()),
             Ok(Some(status)) => {

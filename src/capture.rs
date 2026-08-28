@@ -3,10 +3,11 @@
 use crate::browser::{
     bidi_cookies, browser_is_running, cdp_base_url, cdp_cookies, cdp_version, close_bidi_browser,
     close_cdp_browser, connect_bidi, effective_profile_dir, evaluate_bidi, evaluate_cdp,
-    open_bidi_context, open_cdp_target, prepare_profile, resolve_browser, restart_running_browser,
-    running_browser_conflict, spawn_remote_browser, terminate_spawned_browser,
-    wait_for_bidi_connection, wait_for_cdp_version, wait_for_spawned_browser_exit, Browser,
-    BrowserCookie, BrowserProtocol, CdpVersion, PreparedProfile,
+    open_bidi_context, open_cdp_target, prepare_profile_with_cancel, resolve_browser,
+    restart_running_browser, running_browser_conflict, spawn_remote_browser,
+    terminate_spawned_browser, wait_for_bidi_connection, wait_for_cdp_version,
+    wait_for_spawned_browser_exit, Browser, BrowserCookie, BrowserProtocol, CdpVersion,
+    PreparedProfile,
 };
 use crate::error::{Result, SessionError};
 use reqwest::blocking::Client;
@@ -20,6 +21,7 @@ use std::fs::OpenOptions;
 #[cfg(unix)]
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::sleep;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -100,6 +102,14 @@ pub struct CaptureResult {
 }
 
 pub fn capture(options: &CaptureOptions) -> Result<CaptureResult> {
+    let cancelled = AtomicBool::new(false);
+    capture_with_cancel(options, &cancelled)
+}
+
+pub fn capture_with_cancel(
+    options: &CaptureOptions,
+    cancelled: &AtomicBool,
+) -> Result<CaptureResult> {
     validate_capture_options(options)?;
     let browser = resolve_browser(options.browser.as_deref())?;
     let profile_dir = effective_profile_dir(
@@ -116,6 +126,7 @@ pub fn capture(options: &CaptureOptions) -> Result<CaptureResult> {
             &browser,
             profile_dir.as_deref(),
             script.as_deref(),
+            cancelled,
         )?,
         BrowserProtocol::Bidi => capture_bidi(
             &client,
@@ -123,6 +134,7 @@ pub fn capture(options: &CaptureOptions) -> Result<CaptureResult> {
             &browser,
             profile_dir.as_deref(),
             script.as_deref(),
+            cancelled,
         )?,
     };
     write_private_json(&options.output, &capture)?;
@@ -138,6 +150,14 @@ pub fn capture(options: &CaptureOptions) -> Result<CaptureResult> {
 }
 
 pub fn prepare_login_profile(options: &PrepareProfileOptions) -> Result<PreparedProfile> {
+    let cancelled = AtomicBool::new(false);
+    prepare_login_profile_with_cancel(options, &cancelled)
+}
+
+pub fn prepare_login_profile_with_cancel(
+    options: &PrepareProfileOptions,
+    cancelled: &AtomicBool,
+) -> Result<PreparedProfile> {
     validate_url(&options.url)?;
     if options.profile_dir.is_some() && options.profile_root.is_some() {
         return Err(SessionError::invalid_request(
@@ -150,20 +170,24 @@ pub fn prepare_login_profile(options: &PrepareProfileOptions) -> Result<Prepared
         ));
     }
     let browser = resolve_browser(options.browser.as_deref())?;
-    prepare_profile(
+    prepare_profile_with_cancel(
         &options.url,
         &browser,
         options.profile_dir.as_deref(),
         options.profile_root.as_deref(),
         options.timeout,
+        cancelled,
     )
 }
 
 fn validate_capture_options(options: &CaptureOptions) -> Result<()> {
     validate_url(&options.url)?;
-    if options.cookie_names.is_empty() && options.any_cookie_names.is_empty() {
+    if options.cookie_names.is_empty()
+        && options.any_cookie_names.is_empty()
+        && options.script_file.is_none()
+    {
         return Err(SessionError::invalid_request(
-            "at least one required or alternative cookie name is required",
+            "at least one cookie requirement or page script is required",
         ));
     }
     validate_cookie_names(&options.cookie_names)?;
@@ -237,6 +261,7 @@ fn capture_cdp(
     browser: &Browser,
     profile_dir: Option<&Path>,
     script: Option<&str>,
+    cancelled: &AtomicBool,
 ) -> Result<CaptureFile> {
     let base_url = cdp_base_url(options.port);
     let mut child = None;
@@ -267,7 +292,7 @@ fn capture_cdp(
     };
     let result = (|| {
         let target = open_cdp_target(client, &base_url, &options.url)?;
-        wait_for_capture(options.timeout, || {
+        wait_for_capture(options.timeout, cancelled, || {
             capture_cdp_once(options, browser, &version, target.websocket_url(), script)
         })
     })();
@@ -286,6 +311,7 @@ fn capture_bidi(
     browser: &Browser,
     profile_dir: Option<&Path>,
     script: Option<&str>,
+    cancelled: &AtomicBool,
 ) -> Result<CaptureFile> {
     let mut child = None;
     let mut spawned = false;
@@ -316,7 +342,7 @@ fn capture_bidi(
     };
     let result = (|| {
         let context = open_bidi_context(&mut connection, &options.url)?;
-        wait_for_capture(options.timeout, || {
+        wait_for_capture(options.timeout, cancelled, || {
             capture_bidi_once(options, browser, &mut connection, &context, script)
         })
     })();
@@ -352,11 +378,17 @@ fn prepare_remote_browser(
 
 fn wait_for_capture(
     timeout: Duration,
+    cancelled: &AtomicBool,
     mut capture_once: impl FnMut() -> Result<CaptureFile>,
 ) -> Result<CaptureFile> {
     let started = Instant::now();
     let mut last_error = None;
     loop {
+        if cancelled.load(Ordering::Acquire) {
+            return Err(SessionError::cancelled(
+                "browser session capture was cancelled",
+            ));
+        }
         if started.elapsed() >= timeout {
             return Err(last_error.unwrap_or_else(|| {
                 SessionError::auth_required(
@@ -617,11 +649,10 @@ fn set_private_permissions(path: &Path) -> Result<()> {
 fn set_private_permissions(_path: &Path) -> Result<()> {
     Ok(())
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::atomic::AtomicU64;
 
     static TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -634,6 +665,24 @@ mod tests {
             expires: 0.0,
             secure: true,
             http_only: true,
+        }
+    }
+
+    fn script_capture_options() -> CaptureOptions {
+        CaptureOptions {
+            url: "https://example.com/challenge".to_string(),
+            cookie_names: Vec::new(),
+            any_cookie_names: Vec::new(),
+            all_origin_cookies: false,
+            output: PathBuf::from("/tmp/browser-session-page.json"),
+            browser: Some("chrome".to_string()),
+            profile_dir: Some(PathBuf::from("/tmp/browser-session-page-profile")),
+            profile_root: None,
+            port: DEFAULT_CDP_PORT,
+            timeout: Duration::from_secs(1),
+            proxy: None,
+            script_file: Some(PathBuf::from("/tmp/provider.js")),
+            restart_running: false,
         }
     }
 
@@ -709,6 +758,30 @@ mod tests {
             true,
             Some(Path::new("/tmp/profile"))
         ));
+    }
+
+    #[test]
+    fn page_script_is_a_capture_completion_requirement() {
+        validate_capture_options(&script_capture_options()).unwrap();
+    }
+
+    #[test]
+    fn capture_requires_a_cookie_or_page_script() {
+        let mut options = script_capture_options();
+        options.script_file = None;
+        let error = validate_capture_options(&options).unwrap_err();
+        assert_eq!(error.code, "invalid-request");
+        assert!(error.message.contains("page script"));
+    }
+
+    #[test]
+    fn cancellation_stops_capture_waiting() {
+        let cancelled = AtomicBool::new(true);
+        let error = wait_for_capture(Duration::from_secs(1), &cancelled, || {
+            panic!("cancelled capture evaluated provider state")
+        })
+        .unwrap_err();
+        assert_eq!(error.code, "cancelled");
     }
 
     #[test]

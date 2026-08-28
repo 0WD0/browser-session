@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: MIT
 
 use browser_session::capture::{
-    capture, prepare_login_profile, CaptureOptions, CaptureResult, PrepareProfileOptions,
-    DEFAULT_CDP_PORT, DEFAULT_TIMEOUT_SECS,
+    capture_with_cancel, prepare_login_profile_with_cancel, CaptureOptions, CaptureResult,
+    PrepareProfileOptions, DEFAULT_CDP_PORT, DEFAULT_TIMEOUT_SECS,
 };
 use browser_session::error::{Result, SessionError};
 use serde::Serialize;
@@ -10,10 +10,13 @@ use serde_json::json;
 use std::env;
 use std::path::PathBuf;
 use std::process;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 const PROTOCOL_VERSION: u32 = 1;
 const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+static CANCELLED: AtomicBool = AtomicBool::new(false);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Command {
@@ -71,7 +74,12 @@ struct ErrorEnvelope {
 }
 
 fn main() {
-    match run(env::args().skip(1)) {
+    let result = ctrlc::set_handler(|| CANCELLED.store(true, Ordering::Release))
+        .map_err(|error| {
+            SessionError::helper_failure(format!("cannot install cancellation handler: {error}"))
+        })
+        .and_then(|()| run_with_cancel(env::args().skip(1), &CANCELLED));
+    match result {
         Ok(output) => println!("{output}"),
         Err(error) => {
             eprintln!("{error}");
@@ -98,7 +106,7 @@ fn encode_error(error: &SessionError) -> String {
     .expect("error envelope is serializable")
 }
 
-fn run<I>(arguments: I) -> Result<String>
+fn run_with_cancel<I>(arguments: I, cancelled: &AtomicBool) -> Result<String>
 where
     I: IntoIterator,
     I::Item: Into<String>,
@@ -112,37 +120,43 @@ where
             "version": VERSION
         }),
         Command::Capture => {
-            let capture = capture(&CaptureOptions {
-                url: options
-                    .url
-                    .expect("capture URL was validated by parse_args"),
-                cookie_names: options.cookie_names,
-                any_cookie_names: options.any_cookie_names,
-                all_origin_cookies: options.all_origin_cookies,
-                output: options
-                    .output
-                    .expect("capture output was validated by parse_args"),
-                browser: options.browser,
-                profile_dir: options.profile_dir,
-                profile_root: options.profile_root,
-                port: options.port,
-                timeout: Duration::from_secs(options.timeout_secs),
-                proxy: options.proxy,
-                script_file: options.script_file,
-                restart_running: options.restart_running,
-            })?;
+            let capture = capture_with_cancel(
+                &CaptureOptions {
+                    url: options
+                        .url
+                        .expect("capture URL was validated by parse_args"),
+                    cookie_names: options.cookie_names,
+                    any_cookie_names: options.any_cookie_names,
+                    all_origin_cookies: options.all_origin_cookies,
+                    output: options
+                        .output
+                        .expect("capture output was validated by parse_args"),
+                    browser: options.browser,
+                    profile_dir: options.profile_dir,
+                    profile_root: options.profile_root,
+                    port: options.port,
+                    timeout: Duration::from_secs(options.timeout_secs),
+                    proxy: options.proxy,
+                    script_file: options.script_file,
+                    restart_running: options.restart_running,
+                },
+                cancelled,
+            )?;
             capture_result_json(capture)
         }
         Command::PrepareProfile => {
-            let prepared = prepare_login_profile(&PrepareProfileOptions {
-                url: options
-                    .url
-                    .expect("profile URL was validated by parse_args"),
-                browser: options.browser,
-                profile_dir: options.profile_dir,
-                profile_root: options.profile_root,
-                timeout: Duration::from_secs(options.timeout_secs),
-            })?;
+            let prepared = prepare_login_profile_with_cancel(
+                &PrepareProfileOptions {
+                    url: options
+                        .url
+                        .expect("profile URL was validated by parse_args"),
+                    browser: options.browser,
+                    profile_dir: options.profile_dir,
+                    profile_root: options.profile_root,
+                    timeout: Duration::from_secs(options.timeout_secs),
+                },
+                cancelled,
+            )?;
             json!({
                 "profile": {
                     "prepared": true,
@@ -300,9 +314,12 @@ fn validate_command_options(options: &Options) -> Result<()> {
             if options.output.is_none() {
                 return Err(SessionError::invalid_request("missing --output FILE"));
             }
-            if options.cookie_names.is_empty() && options.any_cookie_names.is_empty() {
+            if options.cookie_names.is_empty()
+                && options.any_cookie_names.is_empty()
+                && options.script_file.is_none()
+            {
                 return Err(SessionError::invalid_request(
-                    "capture requires at least one --cookie or --any-cookie NAME",
+                    "capture requires at least one cookie requirement or --script-file FILE",
                 ));
             }
         }
@@ -338,7 +355,7 @@ fn usage() -> String {
     [
         "usage:",
         "  browser-session version",
-        "  browser-session capture --url URL (--cookie NAME|--any-cookie NAME)... --output FILE [options]",
+        "  browser-session capture --url URL ((--cookie NAME|--any-cookie NAME)...|--script-file FILE) --output FILE [options]",
         "  browser-session prepare-profile --url URL [options]",
         "",
         "capture options:",
@@ -400,6 +417,23 @@ mod tests {
     }
 
     #[test]
+    fn parses_script_only_capture_options() {
+        let options = parse_args([
+            "capture",
+            "--url",
+            "https://example.com/challenge",
+            "--output",
+            "/tmp/session.json",
+            "--script-file",
+            "/tmp/provider.js",
+        ])
+        .unwrap();
+        assert!(options.cookie_names.is_empty());
+        assert!(options.any_cookie_names.is_empty());
+        assert_eq!(options.script_file, Some(PathBuf::from("/tmp/provider.js")));
+    }
+
+    #[test]
     fn parses_profile_preparation_options() {
         let options = parse_args([
             "prepare-profile",
@@ -420,10 +454,11 @@ mod tests {
     }
 
     #[test]
-    fn rejects_capture_without_cookie_requirements() {
+    fn rejects_capture_without_completion_requirements() {
         let error =
             parse_args(["capture", "--url", "https://x.com", "--output", "/tmp/a"]).unwrap_err();
-        assert!(error.message.contains("--cookie"));
+        assert!(error.message.contains("cookie requirement"));
+        assert!(error.message.contains("--script-file"));
     }
 
     #[test]
