@@ -72,6 +72,24 @@
       (should (member "/tmp/browser-session-profile" arguments))
       (should-not (member "--profile-root" arguments)))))
 
+(ert-deftest browser-session-call-profile-root-overrides-global-directory ()
+  "A caller's profile root should win over a global profile directory."
+  (let ((browser-session-profile-directory "/tmp/browser-session-global-profile")
+        (browser-session-profile-root "/tmp/browser-session-global-root")
+        arguments)
+    (cl-letf (((symbol-function 'browser-session--run-helper)
+               (lambda (value _callback _errorback)
+                 (setq arguments value)
+                 'capture-process)))
+      (browser-session-capture
+       :url "https://x.com"
+       :cookies '("auth_token")
+       :output-file "/tmp/browser-session-capture.json"
+       :profile-root "/tmp/browser-session-provider-root")
+      (should (member "--profile-root" arguments))
+      (should (member "/tmp/browser-session-provider-root" arguments))
+      (should-not (member "--profile-dir" arguments)))))
+
 (ert-deftest browser-session-builds-capture-arguments ()
   "Capture arguments should preserve provider-selected requirements."
   (let ((browser-session-cdp-port 29999)
