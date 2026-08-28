@@ -45,7 +45,7 @@ pub struct CaptureOptions {
     pub port: u16,
     pub timeout: Duration,
     pub proxy: Option<String>,
-    pub script_file: Option<PathBuf>,
+    pub script: Option<String>,
     pub restart_running: bool,
 }
 
@@ -117,7 +117,7 @@ pub fn capture_with_cancel(
         options.profile_root.as_deref(),
         &browser,
     );
-    let script = read_script(options.script_file.as_deref())?;
+    let script = options.script.as_deref();
     let client = new_client()?;
     let capture = match browser.protocol() {
         BrowserProtocol::Cdp => capture_cdp(
@@ -125,7 +125,7 @@ pub fn capture_with_cancel(
             options,
             &browser,
             profile_dir.as_deref(),
-            script.as_deref(),
+            script,
             cancelled,
         )?,
         BrowserProtocol::Bidi => capture_bidi(
@@ -133,7 +133,7 @@ pub fn capture_with_cancel(
             options,
             &browser,
             profile_dir.as_deref(),
-            script.as_deref(),
+            script,
             cancelled,
         )?,
     };
@@ -184,10 +184,19 @@ fn validate_capture_options(options: &CaptureOptions) -> Result<()> {
     validate_url(&options.url)?;
     if options.cookie_names.is_empty()
         && options.any_cookie_names.is_empty()
-        && options.script_file.is_none()
+        && options.script.is_none()
     {
         return Err(SessionError::invalid_request(
             "at least one cookie requirement or page script is required",
+        ));
+    }
+    if options
+        .script
+        .as_deref()
+        .is_some_and(|script| script.trim().is_empty())
+    {
+        return Err(SessionError::invalid_request(
+            "page script must not be blank",
         ));
     }
     validate_cookie_names(&options.cookie_names)?;
@@ -238,12 +247,6 @@ fn validate_cookie_names(names: &[String]) -> Result<()> {
         ));
     }
     Ok(())
-}
-
-fn read_script(path: Option<&Path>) -> Result<Option<String>> {
-    path.map(fs::read_to_string).transpose().map_err(|error| {
-        SessionError::helper_failure(format!("cannot read browser-session script: {error}"))
-    })
 }
 
 fn new_client() -> Result<Client> {
@@ -681,7 +684,7 @@ mod tests {
             port: DEFAULT_CDP_PORT,
             timeout: Duration::from_secs(1),
             proxy: None,
-            script_file: Some(PathBuf::from("/tmp/provider.js")),
+            script: Some("(() => null)()".to_string()),
             restart_running: false,
         }
     }
@@ -768,7 +771,7 @@ mod tests {
     #[test]
     fn capture_requires_a_cookie_or_page_script() {
         let mut options = script_capture_options();
-        options.script_file = None;
+        options.script = None;
         let error = validate_capture_options(&options).unwrap_err();
         assert_eq!(error.code, "invalid-request");
         assert!(error.message.contains("page script"));

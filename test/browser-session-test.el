@@ -44,7 +44,7 @@
         (browser-session-profile-root "/tmp/browser-session-root")
         arguments)
     (cl-letf (((symbol-function 'browser-session--run-helper)
-               (lambda (value _callback _errorback)
+               (lambda (value _callback _errorback &optional _input)
                  (setq arguments value)
                  'capture-process)))
       (browser-session-capture
@@ -60,7 +60,7 @@
         (browser-session-profile-root "/tmp/browser-session-root")
         arguments)
     (cl-letf (((symbol-function 'browser-session--run-helper)
-               (lambda (value _callback _errorback)
+               (lambda (value _callback _errorback &optional _input)
                  (setq arguments value)
                  'capture-process)))
       (browser-session-capture
@@ -78,7 +78,7 @@
         (browser-session-profile-root "/tmp/browser-session-global-root")
         arguments)
     (cl-letf (((symbol-function 'browser-session--run-helper)
-               (lambda (value _callback _errorback)
+               (lambda (value _callback _errorback &optional _input)
                  (setq arguments value)
                  'capture-process)))
       (browser-session-capture
@@ -106,6 +106,7 @@
        "chrome"
        nil
        "/tmp/profile-root"
+       nil
        "/tmp/session.js"
        t)
       '("capture" "--url" "https://x.com" "--output" "/tmp/session.json"
@@ -119,7 +120,7 @@
   "A provider page result may be the capture's sole completion requirement."
   (let (arguments)
     (cl-letf (((symbol-function 'browser-session--run-helper)
-               (lambda (value _callback _errorback)
+               (lambda (value _callback _errorback &optional _input)
                  (setq arguments value)
                  'capture-request)))
       (should
@@ -132,6 +133,32 @@
       (should (member "--script-file" arguments))
       (should-not (member "--cookie" arguments))
       (should-not (member "--any-cookie" arguments)))))
+
+(ert-deftest browser-session-sends-provider-script-through-stdin ()
+  "A direct provider script should use stdin rather than argv or a file."
+  (let (arguments input)
+    (cl-letf (((symbol-function 'browser-session--run-helper)
+               (lambda (value _callback _errorback &optional received-input)
+                 (setq arguments value
+                       input received-input)
+                 'capture-request)))
+      (browser-session-capture
+       :url "https://example.com/challenge"
+       :output-file "/tmp/browser-session-page.json"
+       :script "(() => null)()")
+      (should (member "--script-stdin" arguments))
+      (should-not (member "--script-file" arguments))
+      (should (equal input "(() => null)()")))))
+
+(ert-deftest browser-session-rejects-multiple-provider-script-sources ()
+  "Direct and file page scripts are a closed mutually exclusive choice."
+  (should-error
+   (browser-session-capture
+    :url "https://example.com/challenge"
+    :output-file "/tmp/browser-session-page.json"
+    :script "(() => null)()"
+    :script-file "/tmp/provider.js")
+   :type 'user-error))
 
 (ert-deftest browser-session-rejects-capture-without-completion-requirement ()
   "A capture should not complete from URL navigation alone."

@@ -51,7 +51,8 @@ that needs a complete, origin-scoped session may explicitly use
 `--all-origin-cookies`; the helper still filters to the requested URL's host
 and unexpired cookies, including path-scoped cookies for that origin. It never
 captures a browser-wide cookie dump. A provider that needs only a page result
-may omit cookie requirements when it supplies `--script-file`.
+may omit cookie requirements when it supplies `--script-file` or
+`--script-stdin`.
 
 `--profile-dir` means a Chromium user-data directory for Chromium-compatible
 browsers and a profile directory for Firefox or Zen. `--profile-root` asks the
@@ -69,12 +70,22 @@ helper returns the structured
 macOS restart path. Firefox and Zen use WebDriver BiDi; Chromium-compatible
 browsers use CDP.
 
-Optional `--script-file FILE` evaluates a provider-owned JavaScript expression
-in the opened page and stores its JSON result in the private capture file. A
-script should return `null` until its required page state is ready, so the
-helper continues waiting. The generic helper does not interpret non-null page
-results. A page script may be the capture's sole completion requirement, in
-which case the capture contains an empty `cookies` array.
+`--script-file FILE` evaluates a provider-owned JavaScript expression from a
+file. `--script-stdin` reads the expression from standard input without placing
+multiline code in argv:
+
+```bash
+printf '%s' '(() => window.providerState || null)()' |
+  browser-session capture --url https://example.com \
+    --script-stdin --output /tmp/provider-session.json
+```
+
+The two script sources are mutually exclusive. The result is stored in the
+private capture file. A script should return `null` until its required page
+state is ready, so the helper continues waiting. The generic helper does not
+interpret non-null page results. A page script may be the capture's sole
+completion requirement, in which case the capture contains an empty `cookies`
+array.
 
 Prepare an ordinary Firefox-family isolated-profile login before a BiDi
 capture:
@@ -105,6 +116,10 @@ sign in and close it. The provider can then start its normal capture flow.
  :errorback (lambda (error)
               (message "%s" (browser-session-error-message error))))
 ```
+
+Providers may pass an expression directly with `:script`; the Emacs client
+sends it through helper stdin. `:script` and `:script-file` are mutually
+exclusive.
 
 `browser-session-capture` returns a `browser-session-request`. Providers may
 call `browser-session-cancel` to interrupt it; the error callback receives the

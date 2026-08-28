@@ -8,6 +8,8 @@ use browser_session::error::{Result, SessionError};
 use serde::Serialize;
 use serde_json::json;
 use std::env;
+use std::fs;
+use std::io::Read;
 use std::path::PathBuf;
 use std::process;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -27,6 +29,12 @@ enum Command {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+enum ScriptSource {
+    File(PathBuf),
+    Stdin,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct Options {
     command: Command,
     url: Option<String>,
@@ -40,7 +48,7 @@ struct Options {
     port: u16,
     timeout_secs: u64,
     proxy: Option<String>,
-    script_file: Option<PathBuf>,
+    script_source: Option<ScriptSource>,
     restart_running: bool,
 }
 
@@ -120,6 +128,7 @@ where
             "version": VERSION
         }),
         Command::Capture => {
+            let script = read_page_script(options.script_source, std::io::stdin().lock())?;
             let capture = capture_with_cancel(
                 &CaptureOptions {
                     url: options
@@ -137,7 +146,7 @@ where
                     port: options.port,
                     timeout: Duration::from_secs(options.timeout_secs),
                     proxy: options.proxy,
-                    script_file: options.script_file,
+                    script,
                     restart_running: options.restart_running,
                 },
                 cancelled,
@@ -256,11 +265,11 @@ where
             }
             "--proxy" => options.proxy = Some(option_value(&args, &mut index, "proxy")?),
             "--script-file" => {
-                options.script_file = Some(PathBuf::from(option_value(
-                    &args,
-                    &mut index,
-                    "script-file",
-                )?))
+                let path = PathBuf::from(option_value(&args, &mut index, "script-file")?);
+                set_script_source(&mut options, ScriptSource::File(path))?;
+            }
+            "--script-stdin" => {
+                set_script_source(&mut options, ScriptSource::Stdin)?;
             }
             "--restart-running" => options.restart_running = true,
             other => {
@@ -289,7 +298,7 @@ fn default_options(command: Command) -> Options {
         port: DEFAULT_CDP_PORT,
         timeout_secs: DEFAULT_TIMEOUT_SECS,
         proxy: None,
-        script_file: None,
+        script_source: None,
         restart_running: false,
     }
 }
@@ -316,10 +325,10 @@ fn validate_command_options(options: &Options) -> Result<()> {
             }
             if options.cookie_names.is_empty()
                 && options.any_cookie_names.is_empty()
-                && options.script_file.is_none()
+                && options.script_source.is_none()
             {
                 return Err(SessionError::invalid_request(
-                    "capture requires at least one cookie requirement or --script-file FILE",
+                    "capture requires a cookie requirement, --script-file FILE, or --script-stdin",
                 ));
             }
         }
@@ -330,7 +339,7 @@ fn validate_command_options(options: &Options) -> Result<()> {
                 || options.all_origin_cookies
                 || options.port != DEFAULT_CDP_PORT
                 || options.proxy.is_some()
-                || options.script_file.is_some()
+                || options.script_source.is_some()
                 || options.restart_running
             {
                 return Err(SessionError::invalid_request(
@@ -341,6 +350,35 @@ fn validate_command_options(options: &Options) -> Result<()> {
         Command::Help | Command::Version => unreachable!("non-request command was returned"),
     }
     Ok(())
+}
+
+fn set_script_source(options: &mut Options, source: ScriptSource) -> Result<()> {
+    if options.script_source.replace(source).is_some() {
+        return Err(SessionError::invalid_request(
+            "--script-file and --script-stdin are mutually exclusive",
+        ));
+    }
+    Ok(())
+}
+
+fn read_page_script(source: Option<ScriptSource>, mut stdin: impl Read) -> Result<Option<String>> {
+    match source {
+        Some(ScriptSource::File(path)) => fs::read_to_string(path).map(Some).map_err(|error| {
+            SessionError::helper_failure(format!(
+                "cannot read browser-session script file: {error}"
+            ))
+        }),
+        Some(ScriptSource::Stdin) => {
+            let mut script = String::new();
+            stdin.read_to_string(&mut script).map_err(|error| {
+                SessionError::helper_failure(format!(
+                    "cannot read browser-session script from stdin: {error}"
+                ))
+            })?;
+            Ok(Some(script))
+        }
+        None => Ok(None),
+    }
 }
 
 fn option_value(args: &[String], index: &mut usize, name: &str) -> Result<String> {
@@ -355,7 +393,7 @@ fn usage() -> String {
     [
         "usage:",
         "  browser-session version",
-        "  browser-session capture --url URL ((--cookie NAME|--any-cookie NAME)...|--script-file FILE) --output FILE [options]",
+        "  browser-session capture --url URL ((--cookie NAME|--any-cookie NAME)...|--script-file FILE|--script-stdin) --output FILE [options]",
         "  browser-session prepare-profile --url URL [options]",
         "",
         "capture options:",
@@ -366,6 +404,7 @@ fn usage() -> String {
         "  --timeout-secs N          wait timeout (default 180)",
         "  --proxy URL               proxy for a Chromium browser started by the helper",
         "  --script-file FILE        provider-owned JavaScript expression",
+        "  --script-stdin            read provider JavaScript from standard input",
         "  --any-cookie NAME         require one cookie from this alternative set",
         "  --all-origin-cookies      capture all unexpired cookies scoped to URL",
         "  --restart-running         permit one browser restart when supported",
@@ -430,7 +469,46 @@ mod tests {
         .unwrap();
         assert!(options.cookie_names.is_empty());
         assert!(options.any_cookie_names.is_empty());
-        assert_eq!(options.script_file, Some(PathBuf::from("/tmp/provider.js")));
+        assert_eq!(
+            options.script_source,
+            Some(ScriptSource::File(PathBuf::from("/tmp/provider.js")))
+        );
+    }
+
+    #[test]
+    fn parses_and_reads_script_from_stdin() {
+        let options = parse_args([
+            "capture",
+            "--url",
+            "https://example.com/challenge",
+            "--output",
+            "/tmp/session.json",
+            "--script-stdin",
+        ])
+        .unwrap();
+        assert_eq!(options.script_source, Some(ScriptSource::Stdin));
+        let script = read_page_script(
+            options.script_source,
+            std::io::Cursor::new("(() => null)()"),
+        )
+        .unwrap();
+        assert_eq!(script.as_deref(), Some("(() => null)()"));
+    }
+
+    #[test]
+    fn rejects_multiple_script_sources() {
+        let error = parse_args([
+            "capture",
+            "--url",
+            "https://example.com/challenge",
+            "--output",
+            "/tmp/session.json",
+            "--script-file",
+            "/tmp/provider.js",
+            "--script-stdin",
+        ])
+        .unwrap_err();
+        assert!(error.message.contains("mutually exclusive"));
     }
 
     #[test]
@@ -459,6 +537,7 @@ mod tests {
             parse_args(["capture", "--url", "https://x.com", "--output", "/tmp/a"]).unwrap_err();
         assert!(error.message.contains("cookie requirement"));
         assert!(error.message.contains("--script-file"));
+        assert!(error.message.contains("--script-stdin"));
     }
 
     #[test]

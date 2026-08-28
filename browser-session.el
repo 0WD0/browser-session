@@ -152,11 +152,11 @@ browser's normal profile instead."
 
 (defun browser-session--capture-arguments
     (url cookies any-cookies all-origin-cookies output-file browser
-         profile-directory profile-root script-file restart-running)
+         profile-directory profile-root script script-file restart-running)
   "Return capture arguments for URL, cookie requirements, and OUTPUT-FILE.
 COOKIES are individually required; ANY-COOKIES require any one listed name.
 When ALL-ORIGIN-COOKIES is non-nil, capture every unexpired cookie scoped to
-URL.  BROWSER, PROFILE-DIRECTORY, PROFILE-ROOT, SCRIPT-FILE, and
+URL.  BROWSER, PROFILE-DIRECTORY, PROFILE-ROOT, SCRIPT, SCRIPT-FILE, and
 RESTART-RUNNING provide optional capture settings."
   (append
    (list "capture" "--url" url "--output" (expand-file-name output-file))
@@ -164,6 +164,8 @@ RESTART-RUNNING provide optional capture settings."
    (cl-mapcan (lambda (cookie) (list "--any-cookie" cookie)) any-cookies)
    (when all-origin-cookies
      (list "--all-origin-cookies"))
+   (when script
+     (list "--script-stdin"))
    (when-let* ((value (browser-session--nonblank-string script-file)))
      (list "--script-file" (expand-file-name value)))
    (when restart-running
@@ -293,10 +295,11 @@ Signals `browser-session-error' with a structured payload for helper failure."
       (funcall errorback error)
     (message "%s" (browser-session-error-message error))))
 
-(defun browser-session--run-helper (arguments callback errorback)
+(defun browser-session--run-helper (arguments callback errorback &optional input)
   "Run helper with ARGUMENTS asynchronously.
 CALLBACK receives successful metadata.  ERRORBACK receives structured helper
-error data.  Return a `browser-session-request' that can be cancelled."
+error data.  Send optional INPUT to the helper's standard input and close it.
+Return a `browser-session-request' that can be cancelled."
   (unless (file-executable-p browser-session-helper-command)
     (user-error "Browser-session helper is not executable: %s"
                 browser-session-helper-command))
@@ -312,6 +315,7 @@ error data.  Return a `browser-session-request' that can be cancelled."
            :buffer stdout-buffer
            :stderr stderr-buffer
            :noquery t
+           :coding 'utf-8-unix
            :sentinel
            (lambda (finished-process _event)
              (when (memq (process-status finished-process) '(exit signal))
@@ -339,6 +343,9 @@ error data.  Return a `browser-session-request' that can be cancelled."
                  (kill-buffer stdout-buffer)
                  (kill-buffer stderr-buffer)))))))
     (setf (browser-session-request-process request) process)
+    (when input
+      (process-send-string process input)
+      (process-send-eof process))
     request))
 
 ;;;###autoload
@@ -359,23 +366,29 @@ REQUEST must be a live value returned by `browser-session-capture' or
 ;;;###autoload
 (cl-defun browser-session-capture
     (&key url cookies any-cookies all-origin-cookies output-file browser
-          profile-directory profile-root script-file restart-running callback
-          errorback)
+          profile-directory profile-root script script-file restart-running
+          callback errorback)
   "Capture selected browser session fields asynchronously.
 URL and OUTPUT-FILE are required.  COOKIES names fields that must all exist;
-ANY-COOKIES names an alternative group for which one field must exist.
-SCRIPT-FILE is a provider-owned expression whose non-null result completes the
-capture; it may be the sole completion requirement.  ALL-ORIGIN-COOKIES
-requests every unexpired cookie scoped to URL.  BROWSER, PROFILE-DIRECTORY,
-PROFILE-ROOT, and RESTART-RUNNING configure the capture.  CALLBACK receives
-non-secret helper metadata after success.  ERRORBACK receives a structured
-error alist after failure.  Return a cancellable `browser-session-request'."
+ANY-COOKIES names an alternative group for which one field must exist.  SCRIPT
+contains a provider-owned JavaScript expression sent through standard input;
+SCRIPT-FILE names an expression file.  They are mutually exclusive, and either
+may be the sole completion requirement.  ALL-ORIGIN-COOKIES requests every
+unexpired cookie scoped to URL.  BROWSER, PROFILE-DIRECTORY, PROFILE-ROOT, and
+RESTART-RUNNING configure the capture.  CALLBACK receives non-secret helper
+metadata after success.  ERRORBACK receives a structured error alist after
+failure.  Return a cancellable `browser-session-request'."
   (unless (browser-session--nonblank-string url)
     (user-error "A browser-session URL is required"))
   (unless (and (browser-session--cookie-list-p cookies)
                (browser-session--cookie-list-p any-cookies))
     (user-error "Browser-session cookie names must be nonblank strings"))
+  (unless (or (null script) (browser-session--nonblank-string script))
+    (user-error "A browser-session page script must be a nonblank string"))
+  (when (and script (browser-session--nonblank-string script-file))
+    (user-error "Use either a browser-session script string or script file"))
   (unless (or cookies any-cookies
+              (browser-session--nonblank-string script)
               (browser-session--nonblank-string script-file))
     (user-error "At least one cookie requirement or page script is required"))
   (unless (browser-session--nonblank-string output-file)
@@ -389,8 +402,8 @@ error alist after failure.  Return a cancellable `browser-session-request'."
       (or browser browser-session-browser)
       effective-profile-directory
       effective-profile-root
-      script-file restart-running)
-     callback errorback)))
+      script script-file restart-running)
+     callback errorback script)))
 
 ;;;###autoload
 (cl-defun browser-session-prepare-profile
