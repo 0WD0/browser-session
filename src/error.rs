@@ -35,6 +35,10 @@ impl SessionError {
         Self::new("endpoint-in-use", message, false, false)
     }
 
+    pub fn insecure_profile(message: impl Into<String>) -> Self {
+        Self::new("insecure-profile", message, false, false)
+    }
+
     pub fn cancelled(message: impl Into<String>) -> Self {
         Self::new("cancelled", message, false, false)
     }

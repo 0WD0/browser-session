@@ -43,6 +43,7 @@ name = "browser-session"
 version = "0.1.0"
 dependencies = [
  "ctrlc",
+ "libc",
  "reqwest",
  "serde",
  "serde_json",

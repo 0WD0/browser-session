@@ -60,6 +60,10 @@ helper to use automatic isolated profiles below that root for Chrome, Firefox,
 or Zen. It uses `login-profile`, `login-profile-firefox`, or
 `login-profile-zen`, respectively.
 
+On Unix, automatic profiles are created and maintained with mode `0700`, must
+be owned by the current user, and cannot be symbolic links. The helper does not
+change permissions on a profile supplied explicitly with `--profile-dir`.
+
 By default the helper reserves a dynamic loopback port and starts the requested
 browser itself. It never reuses a pre-existing endpoint implicitly. Reusing the
 same profile root preserves browser login across captures, and the helper

@@ -455,6 +455,7 @@ pub fn prepare_profile_with_cancel(
             "profile preparation supports only Firefox and Zen",
         ));
     }
+    let automatic_profile = profile_dir.is_none() && profile_root.is_some();
     let profile_dir =
         effective_profile_dir(profile_dir, profile_root, browser).ok_or_else(|| {
             SessionError::invalid_request(
@@ -462,7 +463,8 @@ pub fn prepare_profile_with_cancel(
             )
         })?;
     let arguments = profile_browser_arguments(&profile_dir, url);
-    let mut child = spawn_browser_process(browser, Some(&profile_dir), arguments)?;
+    let mut child =
+        spawn_browser_process(browser, Some(&profile_dir), automatic_profile, arguments)?;
     if let Err(error) = wait_for_profile_browser_exit(&mut child, timeout, url, cancelled) {
         let _ = child.kill();
         let _ = child.wait();
@@ -1033,6 +1035,7 @@ pub(crate) fn close_bidi_browser(connection: &mut BidiConnection, control: Reque
 pub fn spawn_remote_browser(
     browser: &Browser,
     profile_dir: Option<&Path>,
+    automatic_profile: bool,
     port: u16,
     proxy: Option<&str>,
 ) -> Result<Child> {
@@ -1040,7 +1043,7 @@ pub fn spawn_remote_browser(
         BrowserProtocol::Cdp => cdp_browser_arguments(profile_dir, port, proxy),
         BrowserProtocol::Bidi => bidi_browser_arguments(profile_dir, port),
     };
-    spawn_browser_process(browser, profile_dir, arguments)
+    spawn_browser_process(browser, profile_dir, automatic_profile, arguments)
 }
 
 pub fn wait_for_spawned_browser_exit(child: &mut Option<Child>, timeout: Duration) -> bool {
@@ -1076,15 +1079,11 @@ pub fn terminate_spawned_browser(child: &mut Option<Child>) {
 fn spawn_browser_process(
     browser: &Browser,
     profile_dir: Option<&Path>,
+    automatic_profile: bool,
     arguments: Vec<String>,
 ) -> Result<Child> {
     if let Some(profile_dir) = profile_dir {
-        fs::create_dir_all(profile_dir).map_err(|error| {
-            SessionError::helper_failure(format!(
-                "cannot create browser profile `{}`: {error}",
-                profile_dir.display()
-            ))
-        })?;
+        prepare_profile_directory(profile_dir, automatic_profile)?;
     }
     Command::new(&browser.executable)
         .args(arguments)
@@ -1098,6 +1097,71 @@ fn spawn_browser_process(
                 browser.executable.display()
             ))
         })
+}
+
+fn prepare_profile_directory(profile_dir: &Path, automatic_profile: bool) -> Result<()> {
+    if !automatic_profile {
+        return fs::create_dir_all(profile_dir).map_err(|error| {
+            SessionError::helper_failure(format!(
+                "cannot create browser profile `{}`: {error}",
+                profile_dir.display()
+            ))
+        });
+    }
+    prepare_automatic_profile_directory(profile_dir)
+}
+
+#[cfg(unix)]
+fn prepare_automatic_profile_directory(profile_dir: &Path) -> Result<()> {
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
+
+    let mut builder = fs::DirBuilder::new();
+    builder.recursive(true).mode(0o700);
+    builder.create(profile_dir).map_err(|error| {
+        SessionError::helper_failure(format!(
+            "cannot create automatic browser profile `{}`: {error}",
+            profile_dir.display()
+        ))
+    })?;
+    let metadata = fs::symlink_metadata(profile_dir).map_err(|error| {
+        SessionError::helper_failure(format!(
+            "cannot inspect automatic browser profile `{}`: {error}",
+            profile_dir.display()
+        ))
+    })?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(SessionError::insecure_profile(format!(
+            "automatic browser profile `{}` is not a private directory",
+            profile_dir.display()
+        )));
+    }
+    // SAFETY: `geteuid` has no preconditions and does not retain pointers.
+    let owner = unsafe { libc::geteuid() };
+    if metadata.uid() != owner {
+        return Err(SessionError::insecure_profile(format!(
+            "automatic browser profile `{}` is owned by another user",
+            profile_dir.display()
+        )));
+    }
+    if metadata.permissions().mode() & 0o077 != 0 {
+        fs::set_permissions(profile_dir, fs::Permissions::from_mode(0o700)).map_err(|error| {
+            SessionError::insecure_profile(format!(
+                "cannot protect automatic browser profile `{}`: {error}",
+                profile_dir.display()
+            ))
+        })?;
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn prepare_automatic_profile_directory(profile_dir: &Path) -> Result<()> {
+    fs::create_dir_all(profile_dir).map_err(|error| {
+        SessionError::helper_failure(format!(
+            "cannot create automatic browser profile `{}`: {error}",
+            profile_dir.display()
+        ))
+    })
 }
 
 fn cdp_browser_arguments(
@@ -1794,8 +1858,24 @@ fn percent_encode(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
+    #[cfg(unix)]
+    use std::sync::atomic::AtomicU64;
     use std::sync::Arc;
     use std::thread;
+
+    #[cfg(unix)]
+    static PROFILE_TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    #[cfg(unix)]
+    fn profile_test_root() -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "browser-session-profile-test-{}-{}",
+            std::process::id(),
+            PROFILE_TEST_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ))
+    }
 
     fn stalled_websocket() -> (String, thread::JoinHandle<()>) {
         let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
@@ -1866,6 +1946,56 @@ mod tests {
             ),
             Some(profile.to_path_buf())
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn automatic_profiles_are_private_and_repair_wide_permissions() {
+        let root = profile_test_root();
+        let profile = root.join("login-profile");
+        prepare_profile_directory(&profile, true).unwrap();
+        assert_eq!(
+            fs::metadata(&profile).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+
+        fs::set_permissions(&profile, fs::Permissions::from_mode(0o755)).unwrap();
+        prepare_profile_directory(&profile, true).unwrap();
+        assert_eq!(
+            fs::metadata(&profile).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn explicit_profiles_keep_user_selected_permissions() {
+        let root = profile_test_root();
+        let profile = root.join("explicit-profile");
+        fs::create_dir_all(&profile).unwrap();
+        fs::set_permissions(&profile, fs::Permissions::from_mode(0o755)).unwrap();
+        prepare_profile_directory(&profile, false).unwrap();
+        assert_eq!(
+            fs::metadata(&profile).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn automatic_profiles_reject_symbolic_links() {
+        use std::os::unix::fs::symlink;
+
+        let root = profile_test_root();
+        let target = root.join("target");
+        let profile = root.join("login-profile");
+        fs::create_dir_all(&target).unwrap();
+        symlink(&target, &profile).unwrap();
+        let error = prepare_profile_directory(&profile, true).unwrap_err();
+        assert_eq!(error.code, "insecure-profile");
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[cfg(unix)]

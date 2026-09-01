@@ -311,6 +311,9 @@ fn capture_cdp(
         child = Some(spawn_remote_browser(
             browser,
             profile_dir,
+            options.profile_dir.is_none()
+                && options.profile_root.is_some()
+                && profile_dir.is_some(),
             port,
             options.proxy.as_deref(),
         )?);
@@ -375,6 +378,9 @@ fn capture_bidi(
         child = Some(spawn_remote_browser(
             browser,
             profile_dir,
+            options.profile_dir.is_none()
+                && options.profile_root.is_some()
+                && profile_dir.is_some(),
             port,
             options.proxy.as_deref(),
         )?);
