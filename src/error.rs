@@ -38,6 +38,10 @@ impl SessionError {
     pub fn cancelled(message: impl Into<String>) -> Self {
         Self::new("cancelled", message, false, false)
     }
+
+    pub fn timeout(message: impl Into<String>) -> Self {
+        Self::new("timeout", message, true, false)
+    }
     pub fn auth_required(message: impl Into<String>) -> Self {
         Self::new("auth-required", message, false, true)
     }

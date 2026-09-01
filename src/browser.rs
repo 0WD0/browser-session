@@ -1,24 +1,26 @@
 // SPDX-License-Identifier: MIT
 
 use crate::error::{Result, SessionError};
-use reqwest::blocking::Client;
+use reqwest::{blocking::Client, Url};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::fs;
-use std::net::TcpStream;
+use std::io::ErrorKind;
+use std::net::{SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 use tungstenite::stream::MaybeTlsStream;
-use tungstenite::{connect, Message, WebSocket};
+use tungstenite::{client, Error as WebSocketError, Message, WebSocket};
 
 #[cfg(target_os = "macos")]
 const DEFAULT_DIA_BROWSER_PATH: &str = "/Applications/Dia.app/Contents/MacOS/Dia";
 
 const BROWSER_CHOICES: &str =
     "chrome, brave, edge, chromium, firefox, zen, dia, default, or an executable path";
+const SOCKET_POLL_INTERVAL: Duration = Duration::from_millis(200);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BrowserProtocol {
@@ -165,6 +167,112 @@ impl CdpTarget {
 
 type BrowserSocket = WebSocket<MaybeTlsStream<TcpStream>>;
 
+#[derive(Clone, Copy)]
+pub(crate) struct RequestControl<'a> {
+    deadline: Instant,
+    cancelled: Option<&'a AtomicBool>,
+}
+
+impl<'a> RequestControl<'a> {
+    pub(crate) fn new(timeout: Duration, cancelled: &'a AtomicBool) -> Self {
+        Self {
+            deadline: Instant::now() + timeout,
+            cancelled: Some(cancelled),
+        }
+    }
+
+    pub(crate) fn cleanup(timeout: Duration) -> RequestControl<'static> {
+        RequestControl {
+            deadline: Instant::now() + timeout,
+            cancelled: None,
+        }
+    }
+
+    pub(crate) fn check(self) -> Result<()> {
+        if self
+            .cancelled
+            .is_some_and(|cancelled| cancelled.load(Ordering::Acquire))
+        {
+            return Err(SessionError::cancelled(
+                "browser session capture was cancelled",
+            ));
+        }
+        if Instant::now() >= self.deadline {
+            return Err(SessionError::timeout(
+                "browser session request exceeded its deadline",
+            ));
+        }
+        Ok(())
+    }
+
+    fn poll_timeout(self) -> Result<Duration> {
+        self.check()?;
+        Ok(self
+            .deadline
+            .saturating_duration_since(Instant::now())
+            .min(SOCKET_POLL_INTERVAL))
+    }
+}
+
+fn connect_browser_socket(url: &str, control: RequestControl<'_>) -> Result<BrowserSocket> {
+    control.check()?;
+    let parsed = Url::parse(url).map_err(|error| {
+        SessionError::network(format!("invalid browser websocket URL: {error}"))
+    })?;
+    if parsed.scheme() != "ws" || !matches!(parsed.host_str(), Some("127.0.0.1" | "localhost")) {
+        return Err(SessionError::network(
+            "browser websocket URL must use ws:// on loopback",
+        ));
+    }
+    let port = parsed
+        .port()
+        .ok_or_else(|| SessionError::network("browser websocket URL did not include a port"))?;
+    let address = SocketAddr::from(([127, 0, 0, 1], port));
+    let stream =
+        TcpStream::connect_timeout(&address, control.poll_timeout()?).map_err(|error| {
+            SessionError::network(format!("cannot connect to browser websocket: {error}"))
+        })?;
+    let timeout = control.poll_timeout()?;
+    stream.set_read_timeout(Some(timeout)).map_err(|error| {
+        SessionError::network(format!(
+            "cannot set browser websocket read timeout: {error}"
+        ))
+    })?;
+    stream.set_write_timeout(Some(timeout)).map_err(|error| {
+        SessionError::network(format!(
+            "cannot set browser websocket write timeout: {error}"
+        ))
+    })?;
+    client(url, MaybeTlsStream::Plain(stream))
+        .map(|(socket, _)| socket)
+        .map_err(|error| {
+            SessionError::network(format!("cannot establish browser websocket: {error}"))
+        })
+}
+
+fn read_browser_message(
+    socket: &mut BrowserSocket,
+    control: RequestControl<'_>,
+    context: &str,
+) -> Result<Message> {
+    loop {
+        control.check()?;
+        match socket.read() {
+            Ok(message) => return Ok(message),
+            Err(WebSocketError::Io(error))
+                if matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) =>
+            {
+                continue;
+            }
+            Err(error) => {
+                return Err(SessionError::network(format!(
+                    "cannot read {context} response: {error}"
+                )));
+            }
+        }
+    }
+}
+
 pub struct BidiConnection {
     socket: BrowserSocket,
     next_id: u64,
@@ -173,23 +281,18 @@ pub struct BidiConnection {
 }
 
 impl BidiConnection {
-    fn connect(url: &str) -> Result<Self> {
-        let (socket, _) = connect(url).map_err(|error| {
-            SessionError::network(format!(
-                "cannot connect to WebDriver BiDi websocket `{url}`: {error}"
-            ))
-        })?;
+    fn connect(url: &str, control: RequestControl<'_>) -> Result<Self> {
         Ok(Self {
-            socket,
+            socket: connect_browser_socket(url, control)?,
             next_id: 1,
             user_agent: None,
             browser_name: None,
         })
     }
 
-    fn start_session(&mut self) -> Result<()> {
-        self.call("session.status", json!({}))?;
-        let result = self.call("session.new", json!({ "capabilities": {} }))?;
+    fn start_session(&mut self, control: RequestControl<'_>) -> Result<()> {
+        self.call("session.status", json!({}), control)?;
+        let result = self.call("session.new", json!({ "capabilities": {} }), control)?;
         self.browser_name = result
             .pointer("/capabilities/browserName")
             .and_then(Value::as_str)
@@ -209,7 +312,12 @@ impl BidiConnection {
         self.browser_name.as_deref()
     }
 
-    pub fn call(&mut self, method: &str, params: Value) -> Result<Value> {
+    pub(crate) fn call(
+        &mut self,
+        method: &str,
+        params: Value,
+        control: RequestControl<'_>,
+    ) -> Result<Value> {
         let id = self.next_id;
         self.next_id += 1;
         let payload = json!({
@@ -217,15 +325,14 @@ impl BidiConnection {
             "method": method,
             "params": params
         });
+        control.check()?;
         self.socket
             .send(Message::Text(payload.to_string()))
             .map_err(|error| {
                 SessionError::network(format!("cannot send WebDriver BiDi request: {error}"))
             })?;
         loop {
-            let message = self.socket.read().map_err(|error| {
-                SessionError::network(format!("cannot read WebDriver BiDi response: {error}"))
-            })?;
+            let message = read_browser_message(&mut self.socket, control, "WebDriver BiDi")?;
             let Ok(text) = message.into_text() else {
                 continue;
             };
@@ -638,18 +745,20 @@ pub fn cdp_version(client: &Client, base_url: &str) -> Result<CdpVersion> {
         })
 }
 
-pub fn wait_for_cdp_version(
+pub(crate) fn wait_for_cdp_version(
     client: &Client,
     base_url: &str,
     timeout: Duration,
-) -> Option<CdpVersion> {
-    let started = Instant::now();
+    control: RequestControl<'_>,
+) -> Result<Option<CdpVersion>> {
+    let startup_deadline = Instant::now() + timeout;
     loop {
+        control.check()?;
         if let Ok(version) = cdp_version(client, base_url) {
-            return Some(version);
+            return Ok(Some(version));
         }
-        if started.elapsed() >= timeout {
-            return None;
+        if Instant::now() >= startup_deadline {
+            return Ok(None);
         }
         sleep(Duration::from_millis(150));
     }
@@ -682,8 +791,11 @@ pub fn open_cdp_target(client: &Client, base_url: &str, url: &str) -> Result<Cdp
     Ok(target)
 }
 
-pub fn cdp_cookies(websocket_url: &str) -> Result<Vec<BrowserCookie>> {
-    let response = cdp_call(websocket_url, 1, "Network.getAllCookies")?;
+pub(crate) fn cdp_cookies(
+    websocket_url: &str,
+    control: RequestControl<'_>,
+) -> Result<Vec<BrowserCookie>> {
+    let response = cdp_call(websocket_url, 1, "Network.getAllCookies", control)?;
     let cookies = response
         .pointer("/result/cookies")
         .cloned()
@@ -693,7 +805,11 @@ pub fn cdp_cookies(websocket_url: &str) -> Result<Vec<BrowserCookie>> {
     })
 }
 
-pub fn evaluate_cdp(websocket_url: &str, expression: &str) -> Result<Value> {
+pub(crate) fn evaluate_cdp(
+    websocket_url: &str,
+    expression: &str,
+    control: RequestControl<'_>,
+) -> Result<Value> {
     let response = cdp_call_with_params(
         websocket_url,
         2,
@@ -703,6 +819,7 @@ pub fn evaluate_cdp(websocket_url: &str, expression: &str) -> Result<Value> {
             "returnByValue": true,
             "awaitPromise": true
         }),
+        control,
     )?;
     if response.get("exceptionDetails").is_some() {
         return Err(SessionError::helper_failure(
@@ -715,25 +832,29 @@ pub fn evaluate_cdp(websocket_url: &str, expression: &str) -> Result<Value> {
         .unwrap_or(Value::Null))
 }
 
-pub fn close_cdp_browser(websocket_url: Option<&str>) {
+pub(crate) fn close_cdp_browser(websocket_url: Option<&str>, control: RequestControl<'_>) {
     if let Some(websocket_url) = websocket_url {
-        let _ = cdp_call(websocket_url, 99, "Browser.close");
+        let _ = cdp_call(websocket_url, 99, "Browser.close", control);
     }
 }
 
-pub fn cdp_call(websocket_url: &str, id: u64, method: &str) -> Result<Value> {
-    cdp_call_with_params(websocket_url, id, method, Value::Null)
+pub(crate) fn cdp_call(
+    websocket_url: &str,
+    id: u64,
+    method: &str,
+    control: RequestControl<'_>,
+) -> Result<Value> {
+    cdp_call_with_params(websocket_url, id, method, Value::Null, control)
 }
 
-pub fn cdp_call_with_params(
+pub(crate) fn cdp_call_with_params(
     websocket_url: &str,
     id: u64,
     method: &str,
     params: Value,
+    control: RequestControl<'_>,
 ) -> Result<Value> {
-    let (mut socket, _) = connect(websocket_url).map_err(|error| {
-        SessionError::network(format!("cannot connect to DevTools websocket: {error}"))
-    })?;
+    let mut socket = connect_browser_socket(websocket_url, control)?;
     let mut payload = json!({"id": id, "method": method});
     if !params.is_null() {
         payload
@@ -741,13 +862,12 @@ pub fn cdp_call_with_params(
             .expect("CDP payload is an object")
             .insert("params".to_string(), params);
     }
+    control.check()?;
     socket
         .send(Message::Text(payload.to_string()))
         .map_err(|error| SessionError::network(format!("cannot send DevTools request: {error}")))?;
     loop {
-        let message = socket.read().map_err(|error| {
-            SessionError::network(format!("cannot read DevTools response: {error}"))
-        })?;
+        let message = read_browser_message(&mut socket, control, "DevTools")?;
         let Ok(text) = message.into_text() else {
             continue;
         };
@@ -766,11 +886,15 @@ pub fn cdp_call_with_params(
     }
 }
 
-pub fn connect_bidi(client: &Client, port: u16) -> Result<BidiConnection> {
+pub(crate) fn connect_bidi(
+    client: &Client,
+    port: u16,
+    control: RequestControl<'_>,
+) -> Result<BidiConnection> {
     let mut last_error: Option<SessionError> = None;
     for url in bidi_websocket_urls(client, port) {
-        match BidiConnection::connect(&url).and_then(|mut connection| {
-            connection.start_session()?;
+        match BidiConnection::connect(&url, control).and_then(|mut connection| {
+            connection.start_session(control)?;
             Ok(connection)
         }) {
             Ok(connection) => return Ok(connection),
@@ -784,25 +908,31 @@ pub fn connect_bidi(client: &Client, port: u16) -> Result<BidiConnection> {
     }))
 }
 
-pub fn wait_for_bidi_connection(
+pub(crate) fn wait_for_bidi_connection(
     client: &Client,
     port: u16,
     timeout: Duration,
-) -> Option<BidiConnection> {
-    let started = Instant::now();
+    control: RequestControl<'_>,
+) -> Result<Option<BidiConnection>> {
+    let startup_deadline = Instant::now() + timeout;
     loop {
-        if let Ok(connection) = connect_bidi(client, port) {
-            return Some(connection);
+        control.check()?;
+        if let Ok(connection) = connect_bidi(client, port, control) {
+            return Ok(Some(connection));
         }
-        if started.elapsed() >= timeout {
-            return None;
+        if Instant::now() >= startup_deadline {
+            return Ok(None);
         }
         sleep(Duration::from_millis(150));
     }
 }
 
-pub fn open_bidi_context(connection: &mut BidiConnection, url: &str) -> Result<String> {
-    let result = connection.call("browsingContext.create", json!({ "type": "tab" }))?;
+pub(crate) fn open_bidi_context(
+    connection: &mut BidiConnection,
+    url: &str,
+    control: RequestControl<'_>,
+) -> Result<String> {
+    let result = connection.call("browsingContext.create", json!({ "type": "tab" }), control)?;
     let context = result
         .get("context")
         .and_then(Value::as_str)
@@ -817,12 +947,21 @@ pub fn open_bidi_context(connection: &mut BidiConnection, url: &str) -> Result<S
             "url": url,
             "wait": "interactive"
         }),
+        control,
     )?;
-    let _ = connection.call("browsingContext.activate", json!({ "context": context }));
+    let _ = connection.call(
+        "browsingContext.activate",
+        json!({ "context": context }),
+        control,
+    );
     Ok(context)
 }
 
-pub fn bidi_cookies(connection: &mut BidiConnection, context: &str) -> Result<Vec<BrowserCookie>> {
+pub(crate) fn bidi_cookies(
+    connection: &mut BidiConnection,
+    context: &str,
+    control: RequestControl<'_>,
+) -> Result<Vec<BrowserCookie>> {
     let result = connection
         .call(
             "storage.getCookies",
@@ -832,8 +971,9 @@ pub fn bidi_cookies(connection: &mut BidiConnection, context: &str) -> Result<Ve
                     "context": context
                 }
             }),
+            control,
         )
-        .or_else(|_| connection.call("storage.getCookies", json!({})))?;
+        .or_else(|_| connection.call("storage.getCookies", json!({}), control))?;
     let cookies = result.get("cookies").cloned().ok_or_else(|| {
         SessionError::helper_failure("WebDriver BiDi cookie response did not include cookies")
     })?;
@@ -846,10 +986,11 @@ pub fn bidi_cookies(connection: &mut BidiConnection, context: &str) -> Result<Ve
         .collect()
 }
 
-pub fn evaluate_bidi(
+pub(crate) fn evaluate_bidi(
     connection: &mut BidiConnection,
     context: &str,
     expression: &str,
+    control: RequestControl<'_>,
 ) -> Result<Value> {
     let expression = format!("JSON.stringify({expression})");
     let result = connection.call(
@@ -860,6 +1001,7 @@ pub fn evaluate_bidi(
             "awaitPromise": true,
             "userActivation": false
         }),
+        control,
     )?;
     if result.get("type").and_then(Value::as_str) == Some("exception") {
         return Err(SessionError::helper_failure(
@@ -879,9 +1021,12 @@ pub fn evaluate_bidi(
     })
 }
 
-pub fn close_bidi_browser(connection: &mut BidiConnection) {
-    if connection.call("browser.close", json!({})).is_err() {
-        let _ = connection.call("session.end", json!({}));
+pub(crate) fn close_bidi_browser(connection: &mut BidiConnection, control: RequestControl<'_>) {
+    if connection
+        .call("browser.close", json!({}), control)
+        .is_err()
+    {
+        let _ = connection.call("session.end", json!({}), control);
     }
 }
 
@@ -1649,6 +1794,45 @@ fn percent_encode(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+    use std::thread;
+
+    fn stalled_websocket() -> (String, thread::JoinHandle<()>) {
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handle = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let _socket = tungstenite::accept(stream).unwrap();
+            sleep(Duration::from_millis(400));
+        });
+        (format!("ws://127.0.0.1:{port}/devtools/page/test"), handle)
+    }
+
+    #[test]
+    fn websocket_call_obeys_deadline() {
+        let (url, server) = stalled_websocket();
+        let cancelled = AtomicBool::new(false);
+        let control = RequestControl::new(Duration::from_millis(100), &cancelled);
+        let error = cdp_call(&url, 1, "Network.getAllCookies", control).unwrap_err();
+        assert_eq!(error.code, "timeout");
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn websocket_call_observes_cancellation_while_reading() {
+        let (url, server) = stalled_websocket();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let signal = Arc::clone(&cancelled);
+        let canceller = thread::spawn(move || {
+            sleep(Duration::from_millis(50));
+            signal.store(true, Ordering::Release);
+        });
+        let control = RequestControl::new(Duration::from_secs(2), cancelled.as_ref());
+        let error = cdp_call(&url, 1, "Network.getAllCookies", control).unwrap_err();
+        assert_eq!(error.code, "cancelled");
+        canceller.join().unwrap();
+        server.join().unwrap();
+    }
 
     #[test]
     fn uses_automatic_profiles_for_chrome_and_firefox_family() {

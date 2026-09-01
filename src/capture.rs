@@ -7,7 +7,7 @@ use crate::browser::{
     restart_running_browser, running_browser_conflict, spawn_remote_browser,
     terminate_spawned_browser, wait_for_bidi_connection, wait_for_cdp_version,
     wait_for_spawned_browser_exit, Browser, BrowserCookie, BrowserProtocol, CdpVersion,
-    PreparedProfile,
+    PreparedProfile, RequestControl,
 };
 use crate::error::{Result, SessionError};
 use reqwest::blocking::Client;
@@ -22,9 +22,9 @@ use std::fs::OpenOptions;
 use std::io::Write;
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
 use std::thread::sleep;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 pub const CAPTURE_SCHEMA_VERSION: u32 = 1;
 pub const DEFAULT_CDP_PORT: u16 = 0;
@@ -121,6 +121,7 @@ pub fn capture_with_cancel(
     );
     let script = options.script.as_deref();
     let port = control_port(options.port, options.attach_existing)?;
+    let control = RequestControl::new(options.timeout, cancelled);
     let client = new_client()?;
     let capture = match browser.protocol() {
         BrowserProtocol::Cdp => capture_cdp(
@@ -130,7 +131,7 @@ pub fn capture_with_cancel(
             &browser,
             profile_dir.as_deref(),
             script,
-            cancelled,
+            control,
         )?,
         BrowserProtocol::Bidi => capture_bidi(
             &client,
@@ -139,7 +140,7 @@ pub fn capture_with_cancel(
             &browser,
             profile_dir.as_deref(),
             script,
-            cancelled,
+            control,
         )?,
     };
     write_private_json(&options.output, &capture)?;
@@ -297,12 +298,13 @@ fn capture_cdp(
     browser: &Browser,
     profile_dir: Option<&Path>,
     script: Option<&str>,
-    cancelled: &AtomicBool,
+    control: RequestControl<'_>,
 ) -> Result<CaptureFile> {
     let base_url = cdp_base_url(port);
     let mut child = None;
     let mut spawned = false;
     let version = if options.attach_existing {
+        control.check()?;
         cdp_version(client, &base_url)?
     } else {
         prepare_remote_browser(browser, options, port, profile_dir)?;
@@ -313,7 +315,9 @@ fn capture_cdp(
             options.proxy.as_deref(),
         )?);
         spawned = true;
-        let Some(version) = wait_for_cdp_version(client, &base_url, Duration::from_secs(8)) else {
+        let Some(version) =
+            wait_for_cdp_version(client, &base_url, Duration::from_secs(8), control)?
+        else {
             if should_close_spawned_browser(spawned, profile_dir) {
                 terminate_spawned_browser(&mut child);
             }
@@ -330,18 +334,22 @@ fn capture_cdp(
     };
     let result = (|| {
         let target = open_cdp_target(client, &base_url, &options.url)?;
-        wait_for_capture(options.timeout, cancelled, || {
+        wait_for_capture(control, || {
             capture_cdp_once(
                 options,
                 source_browser,
                 &version,
                 target.websocket_url(),
                 script,
+                control,
             )
         })
     })();
     if should_close_spawned_browser(spawned, profile_dir) {
-        close_cdp_browser(version.browser_websocket_url());
+        close_cdp_browser(
+            version.browser_websocket_url(),
+            RequestControl::cleanup(Duration::from_secs(2)),
+        );
         if !wait_for_spawned_browser_exit(&mut child, Duration::from_secs(5)) {
             terminate_spawned_browser(&mut child);
         }
@@ -356,12 +364,12 @@ fn capture_bidi(
     browser: &Browser,
     profile_dir: Option<&Path>,
     script: Option<&str>,
-    cancelled: &AtomicBool,
+    control: RequestControl<'_>,
 ) -> Result<CaptureFile> {
     let mut child = None;
     let mut spawned = false;
     let mut connection = if options.attach_existing {
-        connect_bidi(client, port)?
+        connect_bidi(client, port, control)?
     } else {
         prepare_remote_browser(browser, options, port, profile_dir)?;
         child = Some(spawn_remote_browser(
@@ -371,7 +379,8 @@ fn capture_bidi(
             options.proxy.as_deref(),
         )?);
         spawned = true;
-        let Some(connection) = wait_for_bidi_connection(client, port, Duration::from_secs(8))
+        let Some(connection) =
+            wait_for_bidi_connection(client, port, Duration::from_secs(8), control)?
         else {
             if should_close_spawned_browser(spawned, profile_dir) {
                 terminate_spawned_browser(&mut child);
@@ -391,13 +400,23 @@ fn capture_bidi(
         browser.name().to_string()
     };
     let result = (|| {
-        let context = open_bidi_context(&mut connection, &options.url)?;
-        wait_for_capture(options.timeout, cancelled, || {
-            capture_bidi_once(options, &source_browser, &mut connection, &context, script)
+        let context = open_bidi_context(&mut connection, &options.url, control)?;
+        wait_for_capture(control, || {
+            capture_bidi_once(
+                options,
+                &source_browser,
+                &mut connection,
+                &context,
+                script,
+                control,
+            )
         })
     })();
     if should_close_spawned_browser(spawned, profile_dir) {
-        close_bidi_browser(&mut connection);
+        close_bidi_browser(
+            &mut connection,
+            RequestControl::cleanup(Duration::from_secs(2)),
+        );
         if !wait_for_spawned_browser_exit(&mut child, Duration::from_secs(5)) {
             terminate_spawned_browser(&mut child);
         }
@@ -426,30 +445,17 @@ fn prepare_remote_browser(
 }
 
 fn wait_for_capture(
-    timeout: Duration,
-    cancelled: &AtomicBool,
+    control: RequestControl<'_>,
     mut capture_once: impl FnMut() -> Result<CaptureFile>,
 ) -> Result<CaptureFile> {
-    let started = Instant::now();
-    let mut last_error = None;
     loop {
-        if cancelled.load(Ordering::Acquire) {
-            return Err(SessionError::cancelled(
-                "browser session capture was cancelled",
-            ));
-        }
-        if started.elapsed() >= timeout {
-            return Err(last_error.unwrap_or_else(|| {
-                SessionError::auth_required(
-                    "browser session did not expose the requested state before timeout",
-                )
-            }));
-        }
+        control.check()?;
         match capture_once() {
             Ok(capture) => return Ok(capture),
-            Err(error) => last_error = Some(error),
+            Err(error) if matches!(error.code, "cancelled" | "timeout") => return Err(error),
+            Err(_) => {}
         }
-        sleep(Duration::from_secs(1));
+        sleep(Duration::from_millis(200));
     }
 }
 
@@ -459,16 +465,17 @@ fn capture_cdp_once(
     version: &CdpVersion,
     websocket_url: &str,
     script: Option<&str>,
+    control: RequestControl<'_>,
 ) -> Result<CaptureFile> {
     let cookies = select_cookies(
-        cdp_cookies(websocket_url)?,
+        cdp_cookies(websocket_url, control)?,
         &options.url,
         &options.cookie_names,
         &options.any_cookie_names,
         options.all_origin_cookies,
     )?;
     let page = script
-        .map(|expression| evaluate_cdp(websocket_url, expression))
+        .map(|expression| evaluate_cdp(websocket_url, expression, control))
         .transpose()?;
     capture_file(
         browser_name,
@@ -485,16 +492,17 @@ fn capture_bidi_once(
     connection: &mut crate::browser::BidiConnection,
     context: &str,
     script: Option<&str>,
+    control: RequestControl<'_>,
 ) -> Result<CaptureFile> {
     let cookies = select_cookies(
-        bidi_cookies(connection, context)?,
+        bidi_cookies(connection, context, control)?,
         &options.url,
         &options.cookie_names,
         &options.any_cookie_names,
         options.all_origin_cookies,
     )?;
     let page = script
-        .map(|expression| evaluate_bidi(connection, context, expression))
+        .map(|expression| evaluate_bidi(connection, context, expression, control))
         .transpose()?;
     capture_file(
         browser_name,
@@ -701,7 +709,7 @@ fn set_private_permissions(_path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::AtomicU64;
+    use std::sync::atomic::{AtomicU64, Ordering};
 
     static TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -839,7 +847,8 @@ mod tests {
     #[test]
     fn cancellation_stops_capture_waiting() {
         let cancelled = AtomicBool::new(true);
-        let error = wait_for_capture(Duration::from_secs(1), &cancelled, || {
+        let control = RequestControl::new(Duration::from_secs(1), &cancelled);
+        let error = wait_for_capture(control, || {
             panic!("cancelled capture evaluated provider state")
         })
         .unwrap_err();

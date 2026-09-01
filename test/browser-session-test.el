@@ -319,15 +319,27 @@
 (ert-deftest browser-session-cancel-signals-a-request-once ()
   "Cancellation should interrupt only the helper represented by the request."
   (let ((request (browser-session--request-create))
-        signals)
+        signals
+        scheduled)
     (setf (browser-session-request-process request) 'fake-process)
     (cl-letf (((symbol-function 'process-live-p) (lambda (_process) t))
               ((symbol-function 'signal-process)
                (lambda (process signal)
-                 (push (list process signal) signals))))
+                 (push (list process signal) signals)))
+              ((symbol-function 'run-at-time)
+               (lambda (delay repeat function &rest arguments)
+                 (setq scheduled
+                       (list delay repeat function arguments))
+                 'fake-timer)))
       (should (browser-session-cancel request))
       (should-not (browser-session-cancel request))
       (should (browser-session-request-canceled-p request))
+      (should (equal (browser-session-request-kill-timer request) 'fake-timer))
+      (should
+       (equal scheduled
+              (list browser-session-cancel-grace-period nil
+                    #'browser-session--force-cancel
+                    (list request 'fake-process))))
       (should (equal signals '((fake-process SIGINT)))))))
 
 (ert-deftest browser-session-reads-private-capture-shape ()

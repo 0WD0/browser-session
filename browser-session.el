@@ -106,6 +106,14 @@ existing endpoint requires an explicit nonzero value."
              (and (integerp value) (> value 0)))))
   :group 'browser-session)
 
+(defcustom browser-session-cancel-grace-period 3
+  "Seconds to wait before forcibly terminating a cancelled helper."
+  :type '(restricted-sexp
+          :match-alternatives
+          ((lambda (value)
+             (and (numberp value) (>= value 0)))))
+  :group 'browser-session)
+
 (defcustom browser-session-proxy nil
   "Optional proxy URL passed to a Chromium browser started by the helper."
   :type '(choice (const :tag "No proxy" nil)
@@ -124,7 +132,8 @@ existing endpoint requires an explicit nonzero value."
                (:constructor browser-session--request-create))
   "One asynchronous browser-session helper request."
   process
-  canceled-p)
+  canceled-p
+  kill-timer)
 
 (defun browser-session--nonblank-string (value)
   "Return VALUE when it is a nonblank string, otherwise nil."
@@ -305,6 +314,13 @@ Signals `browser-session-error' with a structured payload for helper failure."
       (funcall errorback error)
     (message "%s" (browser-session-error-message error))))
 
+(defun browser-session--force-cancel (request process)
+  "Forcibly stop PROCESS when it still belongs to cancelled REQUEST."
+  (when (and (browser-session-request-canceled-p request)
+             (eq process (browser-session-request-process request))
+             (process-live-p process))
+    (delete-process process)))
+
 (defun browser-session--run-helper (arguments callback errorback &optional input)
   "Run helper with ARGUMENTS asynchronously.
 CALLBACK receives successful metadata.  ERRORBACK receives structured helper
@@ -332,24 +348,32 @@ Return a `browser-session-request' that can be cancelled."
              (when (memq (process-status finished-process) '(exit signal))
                (unwind-protect
                    (condition-case error
-                       (if (zerop (process-exit-status finished-process))
-                           (when callback
-                             (funcall callback
-                                      (browser-session--process-result
-                                       stdout-buffer stderr-buffer)))
-                         (progn
-                           (browser-session--process-result
-                            stdout-buffer stderr-buffer)
+                       (if (browser-session-request-canceled-p request)
                            (browser-session--deliver-error
                             errorback
                             (browser-session--error-data
-                             "process-failure"
-                             (format "Browser-session exited with status %d"
-                                     (process-exit-status
-                                      finished-process))))))
+                             "cancelled" "Browser session capture was cancelled"))
+                         (if (zerop (process-exit-status finished-process))
+                             (when callback
+                               (funcall callback
+                                        (browser-session--process-result
+                                         stdout-buffer stderr-buffer)))
+                           (progn
+                             (browser-session--process-result
+                              stdout-buffer stderr-buffer)
+                             (browser-session--deliver-error
+                              errorback
+                              (browser-session--error-data
+                               "process-failure"
+                               (format "Browser-session exited with status %d"
+                                       (process-exit-status
+                                        finished-process)))))))
                      (error
                       (browser-session--deliver-error
                        errorback (browser-session--error-payload error))))
+                 (when-let* ((timer (browser-session-request-kill-timer request)))
+                   (cancel-timer timer))
+                 (setf (browser-session-request-kill-timer request) nil)
                  (setf (browser-session-request-process request) nil)
                  (kill-buffer stdout-buffer)
                  (kill-buffer stderr-buffer)))))))
@@ -361,17 +385,22 @@ Return a `browser-session-request' that can be cancelled."
 
 ;;;###autoload
 (defun browser-session-cancel (request)
-  "Cancel asynchronous browser-session REQUEST cooperatively.
+  "Cancel asynchronous browser-session REQUEST.
 REQUEST must be a live value returned by `browser-session-capture' or
 `browser-session-prepare-profile'.  Its error callback receives the stable
-`cancelled' error after the helper has closed any isolated browser it started."
+`cancelled' error after the helper has closed any isolated browser it started.
+The helper is forcibly terminated if cooperative cancellation exceeds
+`browser-session-cancel-grace-period'."
   (unless (browser-session-request-p request)
     (user-error "Invalid browser-session request"))
   (unless (browser-session-request-canceled-p request)
     (setf (browser-session-request-canceled-p request) t)
     (when-let* ((process (browser-session-request-process request))
                 ((process-live-p process)))
-      (signal-process process 'SIGINT))
+      (signal-process process 'SIGINT)
+      (setf (browser-session-request-kill-timer request)
+            (run-at-time browser-session-cancel-grace-period nil
+                         #'browser-session--force-cancel request process)))
     t))
 
 ;;;###autoload
