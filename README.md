@@ -136,12 +136,13 @@ Providers may pass an expression directly with `:script`; the Emacs client
 sends it through helper stdin. `:script` and `:script-file` are mutually
 exclusive.
 
-`browser-session-capture` returns a `browser-session-request`. Providers may
-call `browser-session-cancel` to interrupt it; the error callback receives the
-stable `cancelled` code after the helper has closed an isolated browser it
-started. `browser-session-page` returns the provider-owned page result from a
-validated private capture. Page results may contain secrets and follow the same
-non-persistence and non-diagnostic rules as cookie values.
+`browser-session-capture` returns a `browser-session-request`. Providers can
+query it with `browser-session-request-live-p` and call
+`browser-session-cancel` to interrupt a live request; the error callback
+receives the stable `cancelled` code after the helper has closed an isolated
+browser it started. `browser-session-page` returns the provider-owned page
+result from a validated private capture. Page results may contain secrets and
+follow the same non-persistence and non-diagnostic rules as cookie values.
 
 The callback receives metadata, not cookie values. `ERRORBACK` receives a
 structured alist; use `browser-session-error-code` for routing decisions such

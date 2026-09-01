@@ -346,6 +346,18 @@
           (should (equal (alist-get 'browser received) "stdin")))
       (delete-file helper))))
 
+(ert-deftest browser-session-request-lifecycle-is-public ()
+  "Consumers should distinguish live, settled, and invalid request values."
+  (let ((request (browser-session--request-create)))
+    (setf (browser-session-request-process request) 'live-process)
+    (cl-letf (((symbol-function 'process-live-p)
+               (lambda (process) (eq process 'live-process))))
+      (should (browser-session-request-live-p request))
+      (setf (browser-session-request-process request) nil)
+      (should-not (browser-session-request-live-p request))
+      (should-not (browser-session-request-live-p 'not-a-request))
+      (should-not (browser-session-cancel request)))))
+
 (ert-deftest browser-session-cancel-signals-a-request-once ()
   "Cancellation should interrupt only the helper represented by the request."
   (let ((request (browser-session--request-create))

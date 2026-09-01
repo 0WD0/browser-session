@@ -395,19 +395,27 @@ Return a `browser-session-request' that can be cancelled."
     request))
 
 ;;;###autoload
+(defun browser-session-request-live-p (request)
+  "Return non-nil when asynchronous browser-session REQUEST is still running."
+  (and (browser-session-request-p request)
+       (when-let* ((process (browser-session-request-process request)))
+         (process-live-p process))))
+
+;;;###autoload
 (defun browser-session-cancel (request)
   "Cancel asynchronous browser-session REQUEST.
-REQUEST must be a live value returned by `browser-session-capture' or
-`browser-session-prepare-profile'.  Its error callback receives the stable
-`cancelled' error after the helper has closed any isolated browser it started.
-The helper is forcibly terminated if cooperative cancellation exceeds
+REQUEST must be a value returned by `browser-session-capture' or
+`browser-session-prepare-profile'.  Return non-nil when a live request was
+cancelled.  Its error callback receives the stable `cancelled' error after the
+helper has closed any isolated browser it started.  The helper is forcibly
+terminated if cooperative cancellation exceeds
 `browser-session-cancel-grace-period'."
   (unless (browser-session-request-p request)
     (user-error "Invalid browser-session request"))
-  (unless (browser-session-request-canceled-p request)
+  (when (and (not (browser-session-request-canceled-p request))
+             (browser-session-request-live-p request))
     (setf (browser-session-request-canceled-p request) t)
-    (when-let* ((process (browser-session-request-process request))
-                ((process-live-p process)))
+    (let ((process (browser-session-request-process request)))
       (signal-process process 'SIGINT)
       (setf (browser-session-request-kill-timer request)
             (run-at-time browser-session-cancel-grace-period nil
