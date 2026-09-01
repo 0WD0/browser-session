@@ -610,15 +610,31 @@ fn select_cookies(
 fn cookie_matches_origin(cookie: &BrowserCookie, url: &Url, now: f64) -> bool {
     cookie_domain_matches(cookie.domain.as_str(), url.host_str().unwrap_or_default())
         && !(cookie.expires > 0.0 && cookie.expires <= now)
+        && (!cookie.secure || url.scheme() == "https")
 }
 
 fn cookie_domain_matches(cookie_domain: &str, host: &str) -> bool {
     let domain = cookie_domain.trim_start_matches('.');
-    host == domain || host.ends_with(&format!(".{domain}"))
+    if domain.is_empty() {
+        return false;
+    }
+    if host.eq_ignore_ascii_case(domain) {
+        return true;
+    }
+    let host = host.as_bytes();
+    let domain = domain.as_bytes();
+    host.len() > domain.len()
+        && host[host.len() - domain.len() - 1] == b'.'
+        && host[host.len() - domain.len()..].eq_ignore_ascii_case(domain)
 }
 
 fn cookie_path_matches(cookie_path: &str, request_path: &str) -> bool {
-    cookie_path.is_empty() || cookie_path == "/" || request_path.starts_with(cookie_path)
+    if cookie_path.is_empty() || cookie_path == "/" || request_path == cookie_path {
+        return true;
+    }
+    request_path
+        .strip_prefix(cookie_path)
+        .is_some_and(|suffix| cookie_path.ends_with('/') || suffix.starts_with('/'))
 }
 
 fn captured_cookie_names(options: &CaptureOptions) -> Vec<String> {
@@ -755,6 +771,56 @@ mod tests {
         assert!(cookie_domain_matches(".x.com", "x.com"));
         assert!(cookie_domain_matches(".x.com", "mobile.x.com"));
         assert!(!cookie_domain_matches(".x.com", "notx.com"));
+    }
+
+    #[test]
+    fn matches_cookie_domains_case_insensitively() {
+        assert!(cookie_domain_matches(".EXAMPLE.COM", "sub.example.com"));
+    }
+
+    #[test]
+    fn applies_cookie_path_boundary_rules() {
+        assert!(!cookie_path_matches("/foo", "/foobar"));
+        assert!(cookie_path_matches("/foo", "/foo"));
+        assert!(cookie_path_matches("/foo", "/foo/bar"));
+        assert!(cookie_path_matches("/foo/", "/foo/bar"));
+    }
+
+    #[test]
+    fn secure_cookies_require_https() {
+        let secure_cookie = cookie("sid", "example.com");
+        let error = select_cookies(
+            vec![secure_cookie.clone()],
+            "http://example.com/",
+            &["sid".to_string()],
+            &[],
+            false,
+        )
+        .unwrap_err();
+        assert_eq!(error.code, "auth-required");
+
+        let selected = select_cookies(
+            vec![secure_cookie],
+            "https://example.com/",
+            &["sid".to_string()],
+            &[],
+            false,
+        )
+        .unwrap();
+        assert_eq!(selected.len(), 1);
+    }
+
+    #[test]
+    fn all_origin_cookies_still_respect_secure_scheme() {
+        let selected = select_cookies(
+            vec![cookie("sid", "example.com")],
+            "http://example.com/",
+            &[],
+            &[],
+            true,
+        )
+        .unwrap();
+        assert!(selected.is_empty());
     }
 
     #[test]
