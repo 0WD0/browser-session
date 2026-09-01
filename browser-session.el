@@ -321,6 +321,30 @@ Signals `browser-session-error' with a structured payload for helper failure."
              (process-live-p process))
     (delete-process process)))
 
+(defun browser-session--helper-outcome
+    (finished-process request stdout-buffer stderr-buffer)
+  "Return the decoded outcome for FINISHED-PROCESS and REQUEST.
+STDOUT-BUFFER and STDERR-BUFFER contain helper diagnostics.  Consumer callback
+execution is deliberately outside this helper error boundary."
+  (if (browser-session-request-canceled-p request)
+      (list 'error
+            (browser-session--error-data
+             "cancelled" "Browser session capture was cancelled"))
+    (condition-case error
+        (if (zerop (process-exit-status finished-process))
+            (list 'success
+                  (browser-session--process-result
+                   stdout-buffer stderr-buffer))
+          (progn
+            (browser-session--process-result stdout-buffer stderr-buffer)
+            (list 'error
+                  (browser-session--error-data
+                   "process-failure"
+                   (format "Browser-session exited with status %d"
+                           (process-exit-status finished-process))))))
+      (error
+       (list 'error (browser-session--error-payload error))))))
+
 (defun browser-session--run-helper (arguments callback errorback &optional input)
   "Run helper with ARGUMENTS asynchronously.
 CALLBACK receives successful metadata.  ERRORBACK receives structured helper
@@ -346,37 +370,24 @@ Return a `browser-session-request' that can be cancelled."
            :sentinel
            (lambda (finished-process _event)
              (when (memq (process-status finished-process) '(exit signal))
-               (unwind-protect
-                   (condition-case error
-                       (if (browser-session-request-canceled-p request)
-                           (browser-session--deliver-error
-                            errorback
-                            (browser-session--error-data
-                             "cancelled" "Browser session capture was cancelled"))
-                         (if (zerop (process-exit-status finished-process))
-                             (when callback
-                               (funcall callback
-                                        (browser-session--process-result
-                                         stdout-buffer stderr-buffer)))
-                           (progn
-                             (browser-session--process-result
-                              stdout-buffer stderr-buffer)
-                             (browser-session--deliver-error
-                              errorback
-                              (browser-session--error-data
-                               "process-failure"
-                               (format "Browser-session exited with status %d"
-                                       (process-exit-status
-                                        finished-process)))))))
-                     (error
-                      (browser-session--deliver-error
-                       errorback (browser-session--error-payload error))))
-                 (when-let* ((timer (browser-session-request-kill-timer request)))
-                   (cancel-timer timer))
-                 (setf (browser-session-request-kill-timer request) nil)
-                 (setf (browser-session-request-process request) nil)
-                 (kill-buffer stdout-buffer)
-                 (kill-buffer stderr-buffer)))))))
+               (let (outcome)
+                 (unwind-protect
+                     (setq outcome
+                           (browser-session--helper-outcome
+                            finished-process request stdout-buffer stderr-buffer))
+                   (when-let* ((timer
+                                (browser-session-request-kill-timer request)))
+                     (cancel-timer timer))
+                   (setf (browser-session-request-kill-timer request) nil)
+                   (setf (browser-session-request-process request) nil)
+                   (kill-buffer stdout-buffer)
+                   (kill-buffer stderr-buffer))
+                 (pcase outcome
+                   (`(success ,data)
+                    (when callback
+                      (funcall callback data)))
+                   (`(error ,payload)
+                    (browser-session--deliver-error errorback payload)))))))))
     (setf (browser-session-request-process request) process)
     (when input
       (process-send-string process input)

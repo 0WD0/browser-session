@@ -285,6 +285,36 @@
           (should (equal (alist-get 'browser received) "fake")))
       (delete-file script))))
 
+(ert-deftest browser-session-callback-errors-bypass-helper-errorback ()
+  "A successful helper must not convert a consumer callback error."
+  (let ((browser-session-helper-command "/fake/browser-session")
+        sentinel stdout-buffer stderr-buffer request errorback-called)
+    (cl-letf (((symbol-function 'file-executable-p) (lambda (_file) t))
+              ((symbol-function 'make-process)
+               (lambda (&rest arguments)
+                 (setq sentinel (plist-get arguments :sentinel)
+                       stdout-buffer (plist-get arguments :buffer)
+                       stderr-buffer (plist-get arguments :stderr))
+                 'fake-process)))
+      (setq request
+            (browser-session--run-helper
+             nil
+             (lambda (_metadata)
+               (error "Consumer callback failed"))
+             (lambda (_error)
+               (setq errorback-called t)))))
+    (with-current-buffer stdout-buffer
+      (insert
+       "{\"ok\":true,\"schema\":1,\"protocol\":1,\"data\":{\"browser\":\"fake\"}}"))
+    (cl-letf (((symbol-function 'process-status) (lambda (_process) 'exit))
+              ((symbol-function 'process-exit-status) (lambda (_process) 0)))
+      (should-error (funcall sentinel 'fake-process "finished\n")
+                    :type 'error))
+    (should-not errorback-called)
+    (should-not (browser-session-request-process request))
+    (should-not (buffer-live-p stdout-buffer))
+    (should-not (buffer-live-p stderr-buffer))))
+
 (ert-deftest browser-session-capture-closes-stdin-after-provider-script ()
   "The real process path should deliver the script and a pipe EOF."
   (skip-unless (and (executable-find "sh") (executable-find "cat")))
