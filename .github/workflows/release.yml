@@ -19,17 +19,17 @@ jobs:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             extension: ""
-          - os: macos-13
+          - os: macos-latest
             target: x86_64-apple-darwin
             extension: ""
-          - os: macos-14
+          - os: macos-latest
             target: aarch64-apple-darwin
             extension: ""
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             extension: ".exe"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
@@ -48,8 +48,12 @@ jobs:
           mkdir -p dist
           asset="browser-session-${GITHUB_REF_NAME}-${{ matrix.target }}${{ matrix.extension }}"
           cp "target/${{ matrix.target }}/release/browser-session${{ matrix.extension }}" "dist/$asset"
-          (cd dist && sha256sum "$asset" > "$asset.sha256")
-      - uses: actions/upload-artifact@v4
+          if command -v sha256sum >/dev/null 2>&1; then
+            (cd dist && sha256sum "$asset" > "$asset.sha256")
+          else
+            (cd dist && shasum -a 256 "$asset" > "$asset.sha256")
+          fi
+      - uses: actions/upload-artifact@v5
         with:
           name: browser-session-${{ matrix.target }}
           path: dist/*
@@ -59,7 +63,7 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v5
         with:
           path: dist
           merge-multiple: true
