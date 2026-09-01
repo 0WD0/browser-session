@@ -3,7 +3,9 @@ name = "browser-session"
 version = "0.1.0"
 edition = "2021"
 license = "MIT"
-description = "Secure browser session capture through CDP"
+description = "Secure browser session capture through CDP and WebDriver BiDi"
+homepage = "https://github.com/0WD0/browser-session"
+repository = "https://github.com/0WD0/browser-session"
 
 [dependencies]
 ctrlc = { version = "3", features = ["termination"] }

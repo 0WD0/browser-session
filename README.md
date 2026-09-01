@@ -22,9 +22,32 @@ The Emacs API deliberately supports two consumer styles:
 The second style is a capability, not an implicit callback behavior. Consumers
 must not persist the returned values or include them in diagnostics.
 
+## Install
+
+`browser-session.el` requires Emacs 29.1 or newer. Install the Emacs package
+from the repository with `package-vc-install`, straight.el, or another
+source-based package manager:
+
+```elisp
+(package-vc-install "https://github.com/0WD0/browser-session")
+```
+
+The Emacs package and Rust helper use the same release version. Install the
+helper from the same checkout with:
+
+```bash
+cargo install --locked --path .
+browser-session version
+```
+
+Alternatively, download the binary for the matching `vX.Y.Z` GitHub release,
+rename it to `browser-session` (`browser-session.exe` on Windows), and place it
+in a directory on Emacs's `exec-path`. The Emacs client finds that executable
+automatically; `browser-session-helper-command` can select an explicit path.
+
 ## Build
 
-Build and verify the helper and Emacs client with:
+Build and verify the helper and Emacs client from a clean checkout with:
 
 ```bash
 make check
