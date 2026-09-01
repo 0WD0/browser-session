@@ -88,12 +88,14 @@ browser's normal profile instead."
                  directory)
   :group 'browser-session)
 
-(defcustom browser-session-cdp-port 29317
-  "Local browser remote-control port used for capture."
+(defcustom browser-session-cdp-port 0
+  "Local browser remote-control port used for capture.
+Zero asks the helper to allocate an ephemeral loopback port.  Attaching to an
+existing endpoint requires an explicit nonzero value."
   :type '(restricted-sexp
           :match-alternatives
           ((lambda (value)
-             (and (integerp value) (<= 1 value 65535)))))
+             (and (integerp value) (<= 0 value 65535)))))
   :group 'browser-session)
 
 (defcustom browser-session-timeout 180
@@ -136,28 +138,33 @@ browser's normal profile instead."
        (cl-every #'browser-session--nonblank-string value)))
 
 (defun browser-session--helper-arguments
-    (&optional browser profile-directory profile-root)
-  "Return helper options for BROWSER, PROFILE-DIRECTORY, and PROFILE-ROOT."
+    (&optional browser profile-directory profile-root attach-existing)
+  "Return helper options for BROWSER, PROFILE-DIRECTORY, and PROFILE-ROOT.
+When ATTACH-EXISTING is non-nil, omit launch-only profile and proxy options."
   (append
    (when-let* ((value (browser-session--nonblank-string browser)))
      (list "--browser" value))
-   (when-let* ((value (browser-session--nonblank-string profile-directory)))
-     (list "--profile-dir" (expand-file-name value)))
-   (when-let* ((value (browser-session--nonblank-string profile-root)))
-     (list "--profile-root" (expand-file-name value)))
+   (unless attach-existing
+     (append
+      (when-let* ((value (browser-session--nonblank-string profile-directory)))
+        (list "--profile-dir" (expand-file-name value)))
+      (when-let* ((value (browser-session--nonblank-string profile-root)))
+        (list "--profile-root" (expand-file-name value)))))
    (list "--port" (number-to-string browser-session-cdp-port)
          "--timeout-secs" (number-to-string browser-session-timeout))
-   (when-let* ((value (browser-session--nonblank-string browser-session-proxy)))
-     (list "--proxy" value))))
+   (unless attach-existing
+     (when-let* ((value (browser-session--nonblank-string browser-session-proxy)))
+       (list "--proxy" value)))))
 
 (defun browser-session--capture-arguments
     (url cookies any-cookies all-origin-cookies output-file browser
-         profile-directory profile-root script script-file restart-running)
+         profile-directory profile-root script script-file restart-running
+         attach-existing)
   "Return capture arguments for URL, cookie requirements, and OUTPUT-FILE.
 COOKIES are individually required; ANY-COOKIES require any one listed name.
 When ALL-ORIGIN-COOKIES is non-nil, capture every unexpired cookie scoped to
-URL.  BROWSER, PROFILE-DIRECTORY, PROFILE-ROOT, SCRIPT, SCRIPT-FILE, and
-RESTART-RUNNING provide optional capture settings."
+URL.  BROWSER, PROFILE-DIRECTORY, PROFILE-ROOT, SCRIPT, SCRIPT-FILE,
+RESTART-RUNNING, and ATTACH-EXISTING provide optional capture settings."
   (append
    (list "capture" "--url" url "--output" (expand-file-name output-file))
    (cl-mapcan (lambda (cookie) (list "--cookie" cookie)) cookies)
@@ -170,7 +177,10 @@ RESTART-RUNNING provide optional capture settings."
      (list "--script-file" (expand-file-name value)))
    (when restart-running
      (list "--restart-running"))
-   (browser-session--helper-arguments browser profile-directory profile-root)))
+   (when attach-existing
+     (list "--attach-existing"))
+   (browser-session--helper-arguments
+    browser profile-directory profile-root attach-existing)))
 
 (defun browser-session--effective-profile-settings
     (profile-directory profile-root)
@@ -368,7 +378,7 @@ REQUEST must be a live value returned by `browser-session-capture' or
 (cl-defun browser-session-capture
     (&key url cookies any-cookies all-origin-cookies output-file browser
           profile-directory profile-root script script-file restart-running
-          callback errorback)
+          attach-existing callback errorback)
   "Capture selected browser session fields asynchronously.
 URL and OUTPUT-FILE are required.  COOKIES names fields that must all exist;
 ANY-COOKIES names an alternative group for which one field must exist.  SCRIPT
@@ -376,9 +386,11 @@ contains a provider-owned JavaScript expression sent through standard input;
 SCRIPT-FILE names an expression file.  They are mutually exclusive, and either
 may be the sole completion requirement.  ALL-ORIGIN-COOKIES requests every
 unexpired cookie scoped to URL.  BROWSER, PROFILE-DIRECTORY, PROFILE-ROOT, and
-RESTART-RUNNING configure the capture.  CALLBACK receives non-secret helper
-metadata after success.  ERRORBACK receives a structured error alist after
-failure.  Return a cancellable `browser-session-request'."
+RESTART-RUNNING configure a browser launched by the helper.  ATTACH-EXISTING
+explicitly attaches to the nonzero `browser-session-cdp-port' and does not use
+profile or proxy settings.  CALLBACK receives non-secret helper metadata after
+success.  ERRORBACK receives a structured error alist after failure.  Return a
+cancellable `browser-session-request'."
   (unless (browser-session--nonblank-string url)
     (user-error "A browser-session URL is required"))
   (unless (and (browser-session--cookie-list-p cookies)
@@ -394,16 +406,20 @@ failure.  Return a cancellable `browser-session-request'."
     (user-error "At least one cookie requirement or page script is required"))
   (unless (browser-session--nonblank-string output-file)
     (user-error "A private browser-session output file is required"))
+  (when (and attach-existing (zerop browser-session-cdp-port))
+    (user-error "Attaching requires a nonzero browser-session control port"))
   (pcase-let ((`(,effective-profile-directory . ,effective-profile-root)
-               (browser-session--effective-profile-settings
-                profile-directory profile-root)))
+               (if attach-existing
+                   (cons nil nil)
+                 (browser-session--effective-profile-settings
+                  profile-directory profile-root))))
     (browser-session--run-helper
      (browser-session--capture-arguments
       url cookies any-cookies all-origin-cookies output-file
       (or browser browser-session-browser)
       effective-profile-directory
       effective-profile-root
-      script script-file restart-running)
+      script script-file restart-running attach-existing)
      callback errorback script)))
 
 ;;;###autoload

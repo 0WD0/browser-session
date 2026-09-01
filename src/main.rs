@@ -50,6 +50,7 @@ struct Options {
     proxy: Option<String>,
     script_source: Option<ScriptSource>,
     restart_running: bool,
+    attach_existing: bool,
 }
 
 #[derive(Serialize)]
@@ -148,6 +149,7 @@ where
                     proxy: options.proxy,
                     script,
                     restart_running: options.restart_running,
+                    attach_existing: options.attach_existing,
                 },
                 cancelled,
             )?;
@@ -272,6 +274,7 @@ where
                 set_script_source(&mut options, ScriptSource::Stdin)?;
             }
             "--restart-running" => options.restart_running = true,
+            "--attach-existing" => options.attach_existing = true,
             other => {
                 return Err(SessionError::invalid_request(format!(
                     "unknown option `{other}`"
@@ -300,6 +303,7 @@ fn default_options(command: Command) -> Options {
         proxy: None,
         script_source: None,
         restart_running: false,
+        attach_existing: false,
     }
 }
 
@@ -331,6 +335,21 @@ fn validate_command_options(options: &Options) -> Result<()> {
                     "capture requires a cookie requirement, --script-file FILE, or --script-stdin",
                 ));
             }
+            if options.attach_existing && options.port == 0 {
+                return Err(SessionError::invalid_request(
+                    "attach-existing requires an explicit nonzero capture port",
+                ));
+            }
+            if options.attach_existing
+                && (options.profile_dir.is_some()
+                    || options.profile_root.is_some()
+                    || options.proxy.is_some()
+                    || options.restart_running)
+            {
+                return Err(SessionError::invalid_request(
+                    "attach-existing cannot be combined with profile, proxy, or restart options",
+                ));
+            }
         }
         Command::PrepareProfile => {
             if options.output.is_some()
@@ -341,6 +360,7 @@ fn validate_command_options(options: &Options) -> Result<()> {
                 || options.proxy.is_some()
                 || options.script_source.is_some()
                 || options.restart_running
+                || options.attach_existing
             {
                 return Err(SessionError::invalid_request(
                     "prepare-profile accepts only url, browser, profile, and timeout options",
@@ -400,7 +420,7 @@ fn usage() -> String {
         "  --browser NAME|PATH       supported browser or executable path",
         "  --profile-dir DIR         isolated profile directory",
         "  --profile-root DIR        automatic Chrome/Firefox/Zen profile root",
-        "  --port N                  local remote-control port (default 29317)",
+        "  --port N                  local remote-control port (default: dynamic)",
         "  --timeout-secs N          wait timeout (default 180)",
         "  --proxy URL               proxy for a Chromium browser started by the helper",
         "  --script-file FILE        provider-owned JavaScript expression",
@@ -408,6 +428,7 @@ fn usage() -> String {
         "  --any-cookie NAME         require one cookie from this alternative set",
         "  --all-origin-cookies      capture all unexpired cookies scoped to URL",
         "  --restart-running         permit one browser restart when supported",
+        "  --attach-existing         explicitly attach to the endpoint at --port",
         "",
         "prepare-profile options:",
         "  --browser NAME|PATH       Firefox or Zen browser",
@@ -453,6 +474,41 @@ mod tests {
         assert_eq!(options.port, 29999);
         assert_eq!(options.timeout_secs, 12);
         assert!(options.restart_running);
+    }
+
+    #[test]
+    fn parses_explicit_existing_endpoint_attachment() {
+        let options = parse_args([
+            "capture",
+            "--url",
+            "https://x.com",
+            "--cookie",
+            "auth_token",
+            "--output",
+            "/tmp/session.json",
+            "--port",
+            "29999",
+            "--attach-existing",
+        ])
+        .unwrap();
+        assert!(options.attach_existing);
+        assert_eq!(options.port, 29999);
+    }
+
+    #[test]
+    fn rejects_attachment_without_an_explicit_port() {
+        let error = parse_args([
+            "capture",
+            "--url",
+            "https://x.com",
+            "--cookie",
+            "auth_token",
+            "--output",
+            "/tmp/session.json",
+            "--attach-existing",
+        ])
+        .unwrap_err();
+        assert!(error.message.contains("explicit nonzero"));
     }
 
     #[test]

@@ -127,6 +127,8 @@ fn root_cookie_path() -> String {
 
 #[derive(Debug, Deserialize)]
 pub struct CdpVersion {
+    #[serde(rename = "Browser")]
+    browser_name: Option<String>,
     #[serde(rename = "webSocketDebuggerUrl")]
     browser_websocket_url: Option<String>,
     #[serde(rename = "User-Agent")]
@@ -136,6 +138,10 @@ pub struct CdpVersion {
 impl CdpVersion {
     pub fn browser_websocket_url(&self) -> Option<&str> {
         self.browser_websocket_url.as_deref()
+    }
+
+    pub fn browser_name(&self) -> Option<&str> {
+        self.browser_name.as_deref()
     }
 
     pub fn user_agent(&self) -> Option<&str> {
@@ -163,6 +169,7 @@ pub struct BidiConnection {
     socket: BrowserSocket,
     next_id: u64,
     user_agent: Option<String>,
+    browser_name: Option<String>,
 }
 
 impl BidiConnection {
@@ -176,12 +183,17 @@ impl BidiConnection {
             socket,
             next_id: 1,
             user_agent: None,
+            browser_name: None,
         })
     }
 
     fn start_session(&mut self) -> Result<()> {
         self.call("session.status", json!({}))?;
         let result = self.call("session.new", json!({ "capabilities": {} }))?;
+        self.browser_name = result
+            .pointer("/capabilities/browserName")
+            .and_then(Value::as_str)
+            .map(str::to_string);
         self.user_agent = result
             .pointer("/capabilities/userAgent")
             .and_then(Value::as_str)
@@ -191,6 +203,10 @@ impl BidiConnection {
 
     pub fn user_agent(&self) -> Option<&str> {
         self.user_agent.as_deref()
+    }
+
+    pub fn browser_name(&self) -> Option<&str> {
+        self.browser_name.as_deref()
     }
 
     pub fn call(&mut self, method: &str, params: Value) -> Result<Value> {

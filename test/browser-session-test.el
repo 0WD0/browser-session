@@ -108,13 +108,35 @@
        "/tmp/profile-root"
        nil
        "/tmp/session.js"
-       t)
+       t
+       nil)
       '("capture" "--url" "https://x.com" "--output" "/tmp/session.json"
         "--cookie" "auth_token" "--any-cookie" "ct0"
         "--all-origin-cookies" "--script-file" "/tmp/session.js"
         "--restart-running" "--browser" "chrome"
         "--profile-root" "/tmp/profile-root"
         "--port" "29999" "--timeout-secs" "42")))))
+
+(ert-deftest browser-session-builds-explicit-attachment-arguments ()
+  "Attaching should omit launch-only profile and proxy settings."
+  (let ((browser-session-cdp-port 29999)
+        (browser-session-profile-root "/tmp/browser-session-root")
+        (browser-session-proxy "http://127.0.0.1:7890")
+        arguments)
+    (cl-letf (((symbol-function 'browser-session--run-helper)
+               (lambda (value _callback _errorback &optional _input)
+                 (setq arguments value)
+                 'capture-request)))
+      (browser-session-capture
+       :url "https://x.com"
+       :cookies '("auth_token")
+       :output-file "/tmp/session.json"
+       :attach-existing t)
+      (should (member "--attach-existing" arguments))
+      (should (member "29999" arguments))
+      (should-not (member "--profile-root" arguments))
+      (should-not (member "--profile-dir" arguments))
+      (should-not (member "--proxy" arguments)))))
 
 (ert-deftest browser-session-allows-page-script-without-cookies ()
   "A provider page result may be the capture's sole completion requirement."

@@ -31,6 +31,10 @@ impl SessionError {
         Self::new("invalid-request", message, false, false)
     }
 
+    pub fn endpoint_in_use(message: impl Into<String>) -> Self {
+        Self::new("endpoint-in-use", message, false, false)
+    }
+
     pub fn cancelled(message: impl Into<String>) -> Self {
         Self::new("cancelled", message, false, false)
     }

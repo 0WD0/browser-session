@@ -60,15 +60,26 @@ helper to use automatic isolated profiles below that root for Chrome, Firefox,
 or Zen. It uses `login-profile`, `login-profile-firefox`, or
 `login-profile-zen`, respectively.
 
-When an existing browser already exposes the configured local endpoint, the
-helper attaches to it and leaves it open. Otherwise, it can start an isolated
-browser and closes only the isolated instance it started after allowing it to
-flush its persistent profile. Reusing the same profile root preserves the
-browser login across captures. If a normal running browser prevents that, the
-helper returns the structured
-`browser-restart-required` error; `--restart-running` permits its explicit
-macOS restart path. Firefox and Zen use WebDriver BiDi; Chromium-compatible
-browsers use CDP.
+By default the helper reserves a dynamic loopback port and starts the requested
+browser itself. It never reuses a pre-existing endpoint implicitly. Reusing the
+same profile root preserves browser login across captures, and the helper
+closes only an isolated browser instance it started after allowing it to flush
+its persistent profile.
+
+Attaching to an endpoint is an explicit, non-isolated operation:
+
+```bash
+browser-session capture --attach-existing --port 9222 \
+  --browser chrome --url https://example.com \
+  --cookie session --output /tmp/session.json
+```
+
+Attach mode cannot be combined with profile, proxy, or restart options and
+cannot prove profile identity. Source metadata comes from the endpoint. If a
+normal running browser prevents a managed launch, the helper returns the
+structured `browser-restart-required` error; `--restart-running` permits its
+explicit macOS restart path. Firefox and Zen use WebDriver BiDi;
+Chromium-compatible browsers use CDP.
 
 `--script-file FILE` evaluates a provider-owned JavaScript expression from a
 file. `--script-stdin` reads the expression from standard input without placing

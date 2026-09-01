@@ -20,13 +20,14 @@ use std::fs;
 use std::fs::OpenOptions;
 #[cfg(unix)]
 use std::io::Write;
+use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::sleep;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 pub const CAPTURE_SCHEMA_VERSION: u32 = 1;
-pub const DEFAULT_CDP_PORT: u16 = 29317;
+pub const DEFAULT_CDP_PORT: u16 = 0;
 pub const DEFAULT_TIMEOUT_SECS: u64 = 180;
 
 const DEFAULT_BROWSER_USER_AGENT: &str = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 \
@@ -47,6 +48,7 @@ pub struct CaptureOptions {
     pub proxy: Option<String>,
     pub script: Option<String>,
     pub restart_running: bool,
+    pub attach_existing: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -118,11 +120,13 @@ pub fn capture_with_cancel(
         &browser,
     );
     let script = options.script.as_deref();
+    let port = control_port(options.port, options.attach_existing)?;
     let client = new_client()?;
     let capture = match browser.protocol() {
         BrowserProtocol::Cdp => capture_cdp(
             &client,
             options,
+            port,
             &browser,
             profile_dir.as_deref(),
             script,
@@ -131,6 +135,7 @@ pub fn capture_with_cancel(
         BrowserProtocol::Bidi => capture_bidi(
             &client,
             options,
+            port,
             &browser,
             profile_dir.as_deref(),
             script,
@@ -139,7 +144,7 @@ pub fn capture_with_cancel(
     };
     write_private_json(&options.output, &capture)?;
     Ok(CaptureResult {
-        browser: browser.name().to_string(),
+        browser: capture.source.browser.clone(),
         output: options.output.clone(),
         url: options.url.clone(),
         cookies: captured_cookie_names(options),
@@ -206,9 +211,19 @@ fn validate_capture_options(options: &CaptureOptions) -> Result<()> {
             "profile-dir and profile-root cannot be used together",
         ));
     }
-    if options.port == 0 {
+    if options.attach_existing && options.port == 0 {
         return Err(SessionError::invalid_request(
-            "capture port must not be zero",
+            "attach-existing requires an explicit nonzero capture port",
+        ));
+    }
+    if options.attach_existing
+        && (options.profile_dir.is_some()
+            || options.profile_root.is_some()
+            || options.proxy.is_some()
+            || options.restart_running)
+    {
+        return Err(SessionError::invalid_request(
+            "attach-existing cannot be combined with profile, proxy, or restart options",
         ));
     }
     if options.timeout.is_zero() {
@@ -258,45 +273,71 @@ fn new_client() -> Result<Client> {
         })
 }
 
+fn control_port(requested: u16, attach_existing: bool) -> Result<u16> {
+    if attach_existing {
+        return Ok(requested);
+    }
+    let listener = TcpListener::bind(("127.0.0.1", requested)).map_err(|error| {
+        SessionError::endpoint_in_use(format!(
+            "cannot reserve browser control port {requested}: {error}"
+        ))
+    })?;
+    listener
+        .local_addr()
+        .map(|address| address.port())
+        .map_err(|error| {
+            SessionError::helper_failure(format!("cannot inspect reserved browser port: {error}"))
+        })
+}
+
 fn capture_cdp(
     client: &Client,
     options: &CaptureOptions,
+    port: u16,
     browser: &Browser,
     profile_dir: Option<&Path>,
     script: Option<&str>,
     cancelled: &AtomicBool,
 ) -> Result<CaptureFile> {
-    let base_url = cdp_base_url(options.port);
+    let base_url = cdp_base_url(port);
     let mut child = None;
     let mut spawned = false;
-    let version = match cdp_version(client, &base_url) {
-        Ok(version) => version,
-        Err(_) => {
-            prepare_remote_browser(browser, options, profile_dir)?;
-            child = Some(spawn_remote_browser(
-                browser,
-                profile_dir,
-                options.port,
-                options.proxy.as_deref(),
-            )?);
-            spawned = true;
-            let Some(version) = wait_for_cdp_version(client, &base_url, Duration::from_secs(8))
-            else {
-                if should_close_spawned_browser(spawned, profile_dir) {
-                    terminate_spawned_browser(&mut child);
-                }
-                return Err(SessionError::network(format!(
-                    "cannot reach browser DevTools on 127.0.0.1:{}",
-                    options.port
-                )));
-            };
-            version
-        }
+    let version = if options.attach_existing {
+        cdp_version(client, &base_url)?
+    } else {
+        prepare_remote_browser(browser, options, port, profile_dir)?;
+        child = Some(spawn_remote_browser(
+            browser,
+            profile_dir,
+            port,
+            options.proxy.as_deref(),
+        )?);
+        spawned = true;
+        let Some(version) = wait_for_cdp_version(client, &base_url, Duration::from_secs(8)) else {
+            if should_close_spawned_browser(spawned, profile_dir) {
+                terminate_spawned_browser(&mut child);
+            }
+            return Err(SessionError::network(format!(
+                "cannot reach browser DevTools on 127.0.0.1:{port}"
+            )));
+        };
+        version
+    };
+    let source_browser = if options.attach_existing {
+        version.browser_name().unwrap_or("attached-cdp")
+    } else {
+        browser.name()
     };
     let result = (|| {
         let target = open_cdp_target(client, &base_url, &options.url)?;
         wait_for_capture(options.timeout, cancelled, || {
-            capture_cdp_once(options, browser, &version, target.websocket_url(), script)
+            capture_cdp_once(
+                options,
+                source_browser,
+                &version,
+                target.websocket_url(),
+                script,
+            )
         })
     })();
     if should_close_spawned_browser(spawned, profile_dir) {
@@ -311,6 +352,7 @@ fn capture_cdp(
 fn capture_bidi(
     client: &Client,
     options: &CaptureOptions,
+    port: u16,
     browser: &Browser,
     profile_dir: Option<&Path>,
     script: Option<&str>,
@@ -318,35 +360,40 @@ fn capture_bidi(
 ) -> Result<CaptureFile> {
     let mut child = None;
     let mut spawned = false;
-    let mut connection = match connect_bidi(client, options.port) {
-        Ok(connection) => connection,
-        Err(_) => {
-            prepare_remote_browser(browser, options, profile_dir)?;
-            child = Some(spawn_remote_browser(
-                browser,
-                profile_dir,
-                options.port,
-                options.proxy.as_deref(),
-            )?);
-            spawned = true;
-            let Some(connection) =
-                wait_for_bidi_connection(client, options.port, Duration::from_secs(8))
-            else {
-                if should_close_spawned_browser(spawned, profile_dir) {
-                    terminate_spawned_browser(&mut child);
-                }
-                return Err(SessionError::network(format!(
-                    "cannot reach browser WebDriver BiDi endpoint on 127.0.0.1:{}",
-                    options.port
-                )));
-            };
-            connection
-        }
+    let mut connection = if options.attach_existing {
+        connect_bidi(client, port)?
+    } else {
+        prepare_remote_browser(browser, options, port, profile_dir)?;
+        child = Some(spawn_remote_browser(
+            browser,
+            profile_dir,
+            port,
+            options.proxy.as_deref(),
+        )?);
+        spawned = true;
+        let Some(connection) = wait_for_bidi_connection(client, port, Duration::from_secs(8))
+        else {
+            if should_close_spawned_browser(spawned, profile_dir) {
+                terminate_spawned_browser(&mut child);
+            }
+            return Err(SessionError::network(format!(
+                "cannot reach browser WebDriver BiDi endpoint on 127.0.0.1:{port}"
+            )));
+        };
+        connection
+    };
+    let source_browser = if options.attach_existing {
+        connection
+            .browser_name()
+            .unwrap_or("attached-bidi")
+            .to_string()
+    } else {
+        browser.name().to_string()
     };
     let result = (|| {
         let context = open_bidi_context(&mut connection, &options.url)?;
         wait_for_capture(options.timeout, cancelled, || {
-            capture_bidi_once(options, browser, &mut connection, &context, script)
+            capture_bidi_once(options, &source_browser, &mut connection, &context, script)
         })
     })();
     if should_close_spawned_browser(spawned, profile_dir) {
@@ -365,14 +412,13 @@ fn should_close_spawned_browser(spawned: bool, profile_dir: Option<&Path>) -> bo
 fn prepare_remote_browser(
     browser: &Browser,
     options: &CaptureOptions,
+    port: u16,
     profile_dir: Option<&Path>,
 ) -> Result<()> {
     if browser_is_running(browser) {
         if options.restart_running {
             restart_running_browser(browser)?;
-        } else if let Some(error) =
-            running_browser_conflict(browser, options.port, profile_dir.is_some())
-        {
+        } else if let Some(error) = running_browser_conflict(browser, port, profile_dir.is_some()) {
             return Err(error);
         }
     }
@@ -409,7 +455,7 @@ fn wait_for_capture(
 
 fn capture_cdp_once(
     options: &CaptureOptions,
-    browser: &Browser,
+    browser_name: &str,
     version: &CdpVersion,
     websocket_url: &str,
     script: Option<&str>,
@@ -425,7 +471,7 @@ fn capture_cdp_once(
         .map(|expression| evaluate_cdp(websocket_url, expression))
         .transpose()?;
     capture_file(
-        browser.name(),
+        browser_name,
         &options.url,
         version.user_agent(),
         cookies,
@@ -435,7 +481,7 @@ fn capture_cdp_once(
 
 fn capture_bidi_once(
     options: &CaptureOptions,
-    browser: &Browser,
+    browser_name: &str,
     connection: &mut crate::browser::BidiConnection,
     context: &str,
     script: Option<&str>,
@@ -451,7 +497,7 @@ fn capture_bidi_once(
         .map(|expression| evaluate_bidi(connection, context, expression))
         .transpose()?;
     capture_file(
-        browser.name(),
+        browser_name,
         &options.url,
         connection.user_agent(),
         cookies,
@@ -686,6 +732,7 @@ mod tests {
             proxy: None,
             script: Some("(() => null)()".to_string()),
             restart_running: false,
+            attach_existing: false,
         }
     }
 
@@ -761,6 +808,18 @@ mod tests {
             true,
             Some(Path::new("/tmp/profile"))
         ));
+    }
+
+    #[test]
+    fn allocates_dynamic_ports_and_rejects_occupied_fixed_ports() {
+        let dynamic = control_port(0, false).unwrap();
+        assert_ne!(dynamic, 0);
+
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let occupied = listener.local_addr().unwrap().port();
+        let error = control_port(occupied, false).unwrap_err();
+        assert_eq!(error.code, "endpoint-in-use");
+        assert_eq!(control_port(occupied, true).unwrap(), occupied);
     }
 
     #[test]
