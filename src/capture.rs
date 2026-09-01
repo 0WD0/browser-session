@@ -1037,6 +1037,34 @@ mod tests {
         assert_eq!(error.code, "auth-required");
     }
 
+    #[test]
+    fn replaces_an_existing_capture_file() {
+        let directory = std::env::temp_dir().join(format!(
+            "browser-session-replace-test-{}-{}",
+            std::process::id(),
+            TEST_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("capture.json");
+        fs::write(&path, b"existing destination").unwrap();
+        let capture = CaptureFile {
+            schema: CAPTURE_SCHEMA_VERSION,
+            source: CaptureSource {
+                browser: "test-browser".to_string(),
+                url: "https://example.com".to_string(),
+                user_agent: None,
+            },
+            cookies: Vec::new(),
+            page: None,
+        };
+
+        write_private_json(&path, &capture).unwrap();
+
+        let installed: CaptureFile = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(installed.source.browser, "test-browser");
+        fs::remove_dir_all(directory).unwrap();
+    }
+
     #[cfg(unix)]
     #[test]
     fn writes_private_capture_files() {
