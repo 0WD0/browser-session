@@ -4,6 +4,7 @@ use crate::error::{Result, SessionError};
 use reqwest::{blocking::Client, Url};
 use serde::Deserialize;
 use serde_json::{json, Value};
+use std::fmt::{Debug, Formatter};
 use std::fs;
 use std::io::ErrorKind;
 use std::net::{SocketAddr, TcpStream};
@@ -108,7 +109,7 @@ pub struct PreparedProfile {
     pub path: PathBuf,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Clone, Deserialize)]
 pub struct BrowserCookie {
     pub name: String,
     pub value: String,
@@ -121,6 +122,21 @@ pub struct BrowserCookie {
     pub secure: bool,
     #[serde(rename = "httpOnly", default)]
     pub http_only: bool,
+}
+
+impl Debug for BrowserCookie {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("BrowserCookie")
+            .field("name", &self.name)
+            .field("value", &"<redacted>")
+            .field("domain", &self.domain)
+            .field("path", &self.path)
+            .field("expires", &self.expires)
+            .field("secure", &self.secure)
+            .field("http_only", &self.http_only)
+            .finish()
+    }
 }
 
 fn root_cookie_path() -> String {
@@ -1790,7 +1806,7 @@ fn dedup_strings(values: Vec<String>) -> Vec<String> {
     result
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 struct BidiCookie {
     name: String,
     value: BidiBytesValue,
@@ -1819,7 +1835,7 @@ impl BidiCookie {
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 #[serde(tag = "type")]
 enum BidiBytesValue {
     #[serde(rename = "string")]

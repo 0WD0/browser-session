@@ -15,6 +15,7 @@ use reqwest::Url;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeSet;
+use std::fmt::{Debug, Formatter};
 use std::fs;
 #[cfg(unix)]
 use std::fs::OpenOptions;
@@ -33,7 +34,7 @@ pub const DEFAULT_TIMEOUT_SECS: u64 = 180;
 const DEFAULT_BROWSER_USER_AGENT: &str = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 \
      (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct CaptureOptions {
     pub url: String,
     pub cookie_names: Vec<String>,
@@ -60,7 +61,7 @@ pub struct PrepareProfileOptions {
     pub timeout: Duration,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Clone, Serialize, Deserialize, PartialEq)]
 pub struct CaptureFile {
     pub schema: u32,
     pub source: CaptureSource,
@@ -77,7 +78,7 @@ pub struct CaptureSource {
     pub user_agent: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Clone, Serialize, Deserialize, PartialEq)]
 pub struct CapturedCookie {
     pub name: String,
     pub value: String,
@@ -87,6 +88,55 @@ pub struct CapturedCookie {
     pub secure: bool,
     #[serde(rename = "httpOnly")]
     pub http_only: bool,
+}
+
+impl Debug for CaptureOptions {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("CaptureOptions")
+            .field("url", &self.url)
+            .field("cookie_names", &self.cookie_names)
+            .field("any_cookie_names", &self.any_cookie_names)
+            .field("all_origin_cookies", &self.all_origin_cookies)
+            .field("output", &self.output)
+            .field("browser", &self.browser)
+            .field("profile_dir", &self.profile_dir)
+            .field("profile_root", &self.profile_root)
+            .field("port", &self.port)
+            .field("timeout", &self.timeout)
+            .field("proxy", &self.proxy)
+            .field("script", &self.script.as_ref().map(|_| "<redacted>"))
+            .field("restart_running", &self.restart_running)
+            .field("attach_existing", &self.attach_existing)
+            .finish()
+    }
+}
+
+impl Debug for CaptureFile {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("CaptureFile")
+            .field("schema", &self.schema)
+            .field("source", &self.source)
+            .field("cookies", &self.cookies)
+            .field("page", &self.page.as_ref().map(|_| "<redacted>"))
+            .finish()
+    }
+}
+
+impl Debug for CapturedCookie {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("CapturedCookie")
+            .field("name", &self.name)
+            .field("value", &"<redacted>")
+            .field("domain", &self.domain)
+            .field("path", &self.path)
+            .field("expires", &self.expires)
+            .field("secure", &self.secure)
+            .field("http_only", &self.http_only)
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -763,6 +813,53 @@ mod tests {
             script: Some("(() => null)()".to_string()),
             restart_running: false,
             attach_existing: false,
+        }
+    }
+
+    #[test]
+    fn secret_bearing_debug_output_is_redacted() {
+        let secret = format!("secret-{}", std::process::id());
+        let browser_cookie = BrowserCookie {
+            name: "sid".to_string(),
+            value: secret.clone(),
+            domain: "example.com".to_string(),
+            path: "/".to_string(),
+            expires: 0.0,
+            secure: true,
+            http_only: true,
+        };
+        let captured_cookie = CapturedCookie {
+            name: "sid".to_string(),
+            value: secret.clone(),
+            domain: "example.com".to_string(),
+            path: "/".to_string(),
+            expires: 0.0,
+            secure: true,
+            http_only: true,
+        };
+        let capture = CaptureFile {
+            schema: CAPTURE_SCHEMA_VERSION,
+            source: CaptureSource {
+                browser: "chrome".to_string(),
+                url: "https://example.com".to_string(),
+                user_agent: None,
+            },
+            cookies: vec![captured_cookie],
+            page: Some(serde_json::json!({ "session": secret.clone() })),
+        };
+        let mut options = script_capture_options();
+        options.script = Some(secret.clone());
+
+        for rendered in [
+            format!("{browser_cookie:?}"),
+            format!("{capture:?}"),
+            format!("{options:?}"),
+        ] {
+            assert!(
+                !rendered.contains(&secret),
+                "secret-bearing debug output was not redacted"
+            );
+            assert!(rendered.contains("<redacted>"));
         }
     }
 
