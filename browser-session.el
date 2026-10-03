@@ -516,10 +516,13 @@ The returned value can contain session material.  Callers must avoid persisting
 it or including it in diagnostics."
   (unless (and (stringp file) (file-readable-p file))
     (user-error "Browser-session capture is not readable: %s" file))
-  (browser-session--decode-capture
-   (with-temp-buffer
-     (insert-file-contents-literally file)
-     (buffer-string))))
+  (let ((text (with-temp-buffer
+                (insert-file-contents-literally file)
+                (prog1 (buffer-string)
+                  (erase-buffer)))))
+    (unwind-protect
+        (browser-session--decode-capture text)
+      (clear-string text))))
 
 ;;;###autoload
 (defun browser-session-cookies (capture)

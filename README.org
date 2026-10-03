@@ -173,8 +173,11 @@ structured alist; use ~browser-session-error-code~ for routing decisions such
 as a deliberate restart confirmation. The Emacs client defaults
 ~browser-session-profile-root~ to
 ~(locate-user-emacs-file "browser-session/")~, giving Chrome, Firefox, and Zen
-stable isolated profiles. Set it to nil only when intentionally using a
-browser's normal profile.
+stable managed profiles shared by consumers. Configure ~browser-session-browser~,
+~browser-session-profile-directory~, and ~browser-session-profile-root~ once;
+Chirp, Bili, QQ, Slackit, Discourse, and GitHub inherit those preferences.
+Different browser kinds still have separate profile directories. Set the root
+to nil only when intentionally using a browser's normal profile.
 
 ~browser-session-prepare-profile~ exposes the Firefox/Zen preparation command
 with the same asynchronous callback conventions.
@@ -193,3 +196,11 @@ browser-session capture
 Do not make this project emit a shared credential file. A provider controls its
 own origin and either an explicit cookie list or the exceptional complete
 origin-scoped capture it genuinely requires.
+
+Share the managed browser profile, not provider credential files. Consumers
+must keep capture outputs and auth validation separate, and delete only files
+they own when a capture finishes or is cancelled. Forgetting one provider's
+imported credentials does not sign its website out of the shared browser.
+Existing provider-specific profiles are neither merged nor deleted by this
+cutover; configure the shared profile and log in there when needed. A running
+browser/profile conflict remains explicit, never an automatic restart.
