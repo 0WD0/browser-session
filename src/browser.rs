@@ -1010,7 +1010,13 @@ pub(crate) fn evaluate_bidi(
     expression: &str,
     control: RequestControl<'_>,
 ) -> Result<Value> {
-    let expression = format!("JSON.stringify({expression})");
+    // A provider expression can end in a semicolon or a line comment.  Evaluate
+    // it as an assignment so its source stays valid, then serialize the resolved
+    // value rather than the Promise itself.
+    let expression = format!(
+        "(async () => {{\nconst __browser_session_result__ = {expression}\n\
+         ;return JSON.stringify(await __browser_session_result__);\n}})()"
+    );
     let result = connection.call(
         "script.evaluate",
         json!({
@@ -1025,6 +1031,9 @@ pub(crate) fn evaluate_bidi(
         return Err(SessionError::helper_failure(
             "browser-session page script raised an exception",
         ));
+    }
+    if result.pointer("/result/type").and_then(Value::as_str) == Some("undefined") {
+        return Ok(Value::Null);
     }
     let text = result
         .pointer("/result/value")
@@ -1928,6 +1937,88 @@ mod tests {
         assert_eq!(error.code, "cancelled");
         canceller.join().unwrap();
         server.join().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "requires an installed Firefox with headless WebDriver BiDi support"]
+    fn firefox_captures_page_callback_results() {
+        struct FirefoxProfile {
+            child: Option<Child>,
+            path: PathBuf,
+        }
+        impl Drop for FirefoxProfile {
+            fn drop(&mut self) {
+                terminate_spawned_browser(&mut self.child);
+                let _ = fs::remove_dir_all(&self.path);
+            }
+        }
+
+        let browser = resolve_browser(Some("firefox")).unwrap();
+        let mut profile = FirefoxProfile {
+            child: None,
+            path: profile_test_root(),
+        };
+        prepare_automatic_profile_directory(&profile.path).unwrap();
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        profile.child = Some(
+            Command::new(browser.executable())
+                .arg("--headless")
+                .args(bidi_browser_arguments(Some(&profile.path), port))
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap(),
+        );
+        let cancelled = AtomicBool::new(false);
+        let control = RequestControl::new(Duration::from_secs(30), &cancelled);
+        let client = Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_secs(1))
+            .build()
+            .unwrap();
+        let mut connection =
+            wait_for_bidi_connection(&client, port, Duration::from_secs(8), control)
+                .unwrap()
+                .expect("Firefox did not start its WebDriver BiDi endpoint");
+        let context = open_bidi_context(&mut connection, "about:blank", control).unwrap();
+        let script = r#"// Provider expressions may include comments and a trailing semicolon.
+            (() => {
+                if (!window.captureCallback) {
+                    window.captureCallback = proof => { window.capturedProof = proof; };
+                }
+                return window.capturedProof || null;
+            })(); // Keep the provider's source intact.
+        "#;
+        assert_eq!(
+            evaluate_bidi(&mut connection, &context, script, control).unwrap(),
+            Value::Null
+        );
+        let expected = json!({ "ticket": "fixture-ticket", "randstr": "fixture-random", "sid": "fixture-sid" });
+        evaluate_bidi(
+            &mut connection,
+            &context,
+            &format!("window.captureCallback({expected});"),
+            control,
+        )
+        .unwrap();
+        assert_eq!(
+            evaluate_bidi(&mut connection, &context, script, control).unwrap(),
+            expected
+        );
+        assert_eq!(
+            evaluate_bidi(
+                &mut connection,
+                &context,
+                "Promise.resolve({proof: 'fixture-proof'});",
+                control,
+            )
+            .unwrap(),
+            json!({ "proof": "fixture-proof" })
+        );
     }
 
     #[test]
