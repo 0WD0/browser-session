@@ -509,7 +509,8 @@ fn wait_for_capture(
         match capture_once() {
             Ok(capture) => return Ok(capture),
             Err(error) if matches!(error.code, "cancelled" | "timeout") => return Err(error),
-            Err(_) => {}
+            Err(error) if error.retryable || error.auth_required => {}
+            Err(error) => return Err(error),
         }
         sleep(Duration::from_millis(200));
     }
@@ -1022,6 +1023,49 @@ mod tests {
         })
         .unwrap_err();
         assert_eq!(error.code, "cancelled");
+    }
+
+    #[test]
+    fn terminal_script_errors_stop_capture_waiting() {
+        let cancelled = AtomicBool::new(false);
+        let control = RequestControl::new(Duration::from_secs(1), &cancelled);
+        let mut attempts = 0;
+        let error = wait_for_capture(control, || {
+            attempts += 1;
+            assert_eq!(attempts, 1, "terminal page errors must not be retried");
+            Err(SessionError::helper_failure(
+                "browser-session page script raised an exception",
+            ))
+        })
+        .unwrap_err();
+        assert_eq!(error.code, "helper-failure");
+    }
+
+    #[test]
+    fn pending_page_state_and_transient_errors_keep_capture_waiting() {
+        let cancelled = AtomicBool::new(false);
+        let control = RequestControl::new(Duration::from_secs(2), &cancelled);
+        let mut attempts = 0;
+        let capture = wait_for_capture(control, || {
+            attempts += 1;
+            match attempts {
+                1 => Err(SessionError::auth_required("page script is not ready")),
+                2 => Err(SessionError::network("temporary connection failure")),
+                _ => capture_file(
+                    "test-browser",
+                    "https://example.com",
+                    None,
+                    Vec::new(),
+                    Some(serde_json::json!({ "proof": "fixture-proof" })),
+                ),
+            }
+        })
+        .unwrap();
+        assert_eq!(attempts, 3);
+        assert_eq!(
+            capture.page,
+            Some(serde_json::json!({ "proof": "fixture-proof" }))
+        );
     }
 
     #[test]
